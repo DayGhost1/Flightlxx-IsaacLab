@@ -1,0 +1,1972 @@
+diff --git a/fast_td3/environments/isaaclab_env.py b/fast_td3/environments/isaaclab_env.py
+index 2374ebc..3ca1714 100644
+--- a/fast_td3/environments/isaaclab_env.py
++++ b/fast_td3/environments/isaaclab_env.py
+@@ -21,6 +21,14 @@ class IsaacLabEnv:
+         simulation_app = app_launcher.app
+
+         import isaaclab_tasks
++        # Register the external FlightLxx task when its package is installed.
++        try:
++            import flightlxx_isaaclab.tasks  # noqa: F401
++        except ModuleNotFoundError as exc:
++            if task_name.startswith("Isaac-FlightLxx-"):
++                raise ModuleNotFoundError(
++                    "FlightLxx task requested but flightlxx_isaaclab is not installed"
++                ) from exc
+         from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+
+         env_cfg = parse_env_cfg(
+@@ -68,6 +76,23 @@ class IsaacLabEnv:
+         obs = obs_dict["policy"]
+         critic_obs = obs_dict["critic"] if self.asymmetric_obs else None
+         info_ret = {"time_outs": truncations, "observations": {"critic": critic_obs}}
++        # Preserve the compact labels used by task-aware Replay samplers.  The
++        # wrapper previously forwarded only event_type, silently collapsing the
++        # easy/current/probe curriculum bands back to a binary label.
++        for replay_key in (
++            "event_type",
++            "curriculum_band",
++            "impact_phase",
++            "episode_difficulty",
++            "initial_difficulty",
++            "disturbance_difficulty",
++            "motor_saturation_fraction",
++            "domain_parameters",
++        ):
++            if replay_key in infos:
++                info_ret[replay_key] = infos[replay_key]
++        if "log" in infos:
++            info_ret["log"] = infos["log"]
+         # NOTE: There's really no way to get the raw observations from IsaacLab
+         # We just use the 'reset_obs' as next_obs, unfortunately.
+         # See https://github.com/isaac-sim/IsaacLab/issues/1362
+@@ -77,6 +102,24 @@ class IsaacLabEnv:
+         }
+         return obs, rew, dones, info_ret
+
++    def get_training_state(self) -> dict:
++        env = self.envs.unwrapped
++        return env.get_training_state() if hasattr(env, "get_training_state") else {}
++
++    def load_training_state(self, state: dict) -> None:
++        env = self.envs.unwrapped
++        if hasattr(env, "load_training_state"):
++            env.load_training_state(state)
++
++    def begin_fixed_evaluation(self, protocol) -> None:
++        self.envs.unwrapped.begin_fixed_evaluation(protocol)
++
++    def evaluation_step_metrics(self) -> dict:
++        return self.envs.unwrapped.evaluation_step_metrics()
++
++    def end_fixed_evaluation(self) -> None:
++        self.envs.unwrapped.end_fixed_evaluation()
++
+     def render(self):
+         raise NotImplementedError(
+             "We don't support rendering for IsaacLab environments"
+diff --git a/fast_td3/fast_td3_utils.py b/fast_td3/fast_td3_utils.py
+index 273ac0e..0326a30 100644
+--- a/fast_td3/fast_td3_utils.py
++++ b/fast_td3/fast_td3_utils.py
+@@ -9,6 +9,66 @@ import torch.distributed as dist
+ from tensordict import TensorDict
+
+
++def extract_replay_metadata(infos: dict, event_type: torch.Tensor) -> dict[str, torch.Tensor]:
++    """Return compact curriculum labels, including legacy-safe defaults."""
++
++    event_type = event_type.to(torch.uint8)
++    bands = infos.get("curriculum_band", event_type * 3).to(
++        device=event_type.device, dtype=torch.uint8
++    )
++    phases = infos.get("impact_phase", torch.zeros_like(event_type)).to(
++        device=event_type.device, dtype=torch.uint8
++    )
++    difficulties = infos.get(
++        "episode_difficulty",
++        torch.zeros(event_type.shape, device=event_type.device, dtype=torch.float),
++    ).to(device=event_type.device, dtype=torch.float)
++    initial_difficulty = infos.get(
++        "initial_difficulty",
++        torch.zeros(event_type.shape, device=event_type.device, dtype=torch.float),
++    ).to(device=event_type.device, dtype=torch.float)
++    disturbance_difficulty = infos.get(
++        "disturbance_difficulty",
++        torch.zeros(event_type.shape, device=event_type.device, dtype=torch.float),
++    ).to(device=event_type.device, dtype=torch.float)
++    motor_saturation_fraction = infos.get(
++        "motor_saturation_fraction",
++        torch.zeros(event_type.shape, device=event_type.device, dtype=torch.float),
++    ).to(device=event_type.device, dtype=torch.float)
++    domain_parameters = infos.get(
++        "domain_parameters",
++        torch.zeros((event_type.numel(), 8), device=event_type.device, dtype=torch.float),
++    ).to(device=event_type.device, dtype=torch.float)
++    if domain_parameters.shape != (event_type.numel(), 8):
++        raise ValueError("domain_parameters must have shape [num_envs, 8]")
++    return {
++        "curriculum_band": bands,
++        "impact_phase": phases,
++        "episode_difficulty": difficulties,
++        "initial_difficulty": initial_difficulty,
++        "disturbance_difficulty": disturbance_difficulty,
++        "motor_saturation_fraction": motor_saturation_fraction,
++        "domain_parameters": domain_parameters,
++    }
++
++
++def replay_log_metrics(replay) -> dict[str, float]:
++    """Format measured Replay occupancy and last-sample statistics for logging."""
++
++    diagnostics = replay.diagnostics()
++    samples = replay.last_sample_stats
++    logs = {
++        f"Replay/{name}": float(value)
++        for name, value in {**diagnostics, **samples}.items()
++    }
++    # Only the stratified sampler owns this aggregate.  For legacy binary replay,
++    # train.py already logs its measured event fraction and that value must not
++    # be overwritten by the unused four-band counters above.
++    if getattr(replay, "band_balance_fractions", None) is not None:
++        logs["replay_impact_fraction"] = float(samples.get("sample_impact", 0.0))
++    return logs
++
++
+ class SimpleReplayBuffer(nn.Module):
+     def __init__(
+         self,
+@@ -19,6 +79,12 @@ class SimpleReplayBuffer(nn.Module):
+         n_critic_obs: int,
+         asymmetric_obs: bool = False,
+         playground_mode: bool = False,
++        event_balance_fraction: Optional[float] = None,
++        band_balance_fractions: Optional[tuple[float, float, float, float, float]] = None,
++        failure_context_fraction: float = 0.0,
++        failure_context_steps: int = 50,
++        active_impact_fraction: float = 0.0,
++        recovery_phase_fraction: float = 0.0,
+         n_steps: int = 1,
+         gamma: float = 0.99,
+         device=None,
+@@ -42,6 +108,38 @@ class SimpleReplayBuffer(nn.Module):
+         self.n_critic_obs = n_critic_obs
+         self.asymmetric_obs = asymmetric_obs
+         self.playground_mode = playground_mode and asymmetric_obs
++        # Isaac Lab critic observations also use [policy, privileged] concatenation.
++        # Store the suffix for every asymmetric environment instead of duplicating policy history.
++        self.compact_asymmetric = asymmetric_obs
++        self.event_balance_fraction = event_balance_fraction
++        self.band_balance_fractions = (
++            tuple(float(value) for value in band_balance_fractions)
++            if band_balance_fractions is not None
++            else None
++        )
++        if self.band_balance_fractions is not None:
++            if len(self.band_balance_fractions) != 5:
++                raise ValueError("band_balance_fractions must contain five values")
++            if any(value < 0.0 for value in self.band_balance_fractions):
++                raise ValueError("band_balance_fractions must be non-negative")
++            if abs(sum(self.band_balance_fractions) + failure_context_fraction - 1.0) > 1.0e-6:
++                raise ValueError(
++                    "band_balance_fractions plus failure_context_fraction must sum to one"
++                )
++            if n_steps != 1:
++                raise ValueError("stratified curriculum replay currently requires n_steps=1")
++        if not 0.0 <= failure_context_fraction <= 1.0:
++            raise ValueError("failure_context_fraction must be between zero and one")
++        if failure_context_steps <= 0:
++            raise ValueError("failure_context_steps must be positive")
++        if not 0.0 <= active_impact_fraction <= 1.0:
++            raise ValueError("active_impact_fraction must be between zero and one")
++        if not 0.0 <= recovery_phase_fraction <= 1.0:
++            raise ValueError("recovery_phase_fraction must be between zero and one")
++        self.failure_context_fraction = float(failure_context_fraction)
++        self.failure_context_steps = int(failure_context_steps)
++        self.active_impact_fraction = float(active_impact_fraction)
++        self.recovery_phase_fraction = float(recovery_phase_fraction)
+         self.gamma = gamma
+         self.n_steps = n_steps
+         self.device = device
+@@ -63,7 +161,7 @@ class SimpleReplayBuffer(nn.Module):
+             (n_env, buffer_size, n_obs), device=device, dtype=torch.float
+         )
+         if asymmetric_obs:
+-            if self.playground_mode:
++            if self.compact_asymmetric:
+                 # Only store the privileged part of observations (n_critic_obs - n_obs)
+                 self.privileged_obs_size = n_critic_obs - n_obs
+                 self.privileged_observations = torch.zeros(
+@@ -85,6 +183,46 @@ class SimpleReplayBuffer(nn.Module):
+                     (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
+                 )
+         self.ptr = 0
++        self.event_types = torch.zeros(
++            (n_env, buffer_size), device=device, dtype=torch.uint8
++        )
++        self.curriculum_bands = torch.zeros(
++            (n_env, buffer_size), device=device, dtype=torch.uint8
++        )
++        self.impact_phases = torch.zeros(
++            (n_env, buffer_size), device=device, dtype=torch.uint8
++        )
++        self.episode_difficulties = torch.zeros(
++            (n_env, buffer_size), device=device, dtype=torch.float16
++        )
++        self.initial_difficulties = torch.zeros(
++            (n_env, buffer_size), device=device, dtype=torch.float16
++        )
++        self.disturbance_difficulties = torch.zeros(
++            (n_env, buffer_size), device=device, dtype=torch.float16
++        )
++        self.motor_saturation_fractions = torch.zeros(
++            (n_env, buffer_size), device=device, dtype=torch.float16
++        )
++        self.domain_parameters = torch.zeros(
++            (n_env, buffer_size, 8), device=device, dtype=torch.float16
++        )
++        self.failure_contexts = torch.zeros(
++            (n_env, buffer_size), device=device, dtype=torch.uint8
++        )
++        self.last_sample_stats: dict[str, float] = {
++            "sample_no_impact": 0.0,
++            "sample_easy": 0.0,
++            "sample_middle": 0.0,
++            "sample_current": 0.0,
++            "sample_probe": 0.0,
++            "sample_failure_context": 0.0,
++            "sample_impact": 0.0,
++            "sample_active_impact": 0.0,
++            "sample_recovery_phase": 0.0,
++            "fallback_fraction": 0.0,
++        }
++        self.legacy_metadata = False
+
+     @torch.no_grad()
+     def extend(
+@@ -104,12 +242,40 @@ class SimpleReplayBuffer(nn.Module):
+         self.rewards[:, ptr] = rewards
+         self.dones[:, ptr] = dones
+         self.truncations[:, ptr] = truncations
++        self.failure_contexts[:, ptr] = 0
+         self.next_observations[:, ptr] = next_observations
++        if "event_type" in tensor_dict.keys():
++            self.event_types[:, ptr] = tensor_dict["event_type"].to(torch.uint8)
++        else:
++            self.event_types[:, ptr] = 0
++        if "curriculum_band" in tensor_dict.keys():
++            self.curriculum_bands[:, ptr] = tensor_dict["curriculum_band"].to(torch.uint8)
++        else:
++            self.curriculum_bands[:, ptr] = self.event_types[:, ptr] * 2
++        if "impact_phase" in tensor_dict.keys():
++            self.impact_phases[:, ptr] = tensor_dict["impact_phase"].to(torch.uint8)
++        else:
++            self.impact_phases[:, ptr] = 0
++        if "episode_difficulty" in tensor_dict.keys():
++            self.episode_difficulties[:, ptr] = tensor_dict["episode_difficulty"].to(torch.float16)
++        else:
++            self.episode_difficulties[:, ptr] = 0.0
++        for key, storage in (
++            ("initial_difficulty", self.initial_difficulties),
++            ("disturbance_difficulty", self.disturbance_difficulties),
++            ("motor_saturation_fraction", self.motor_saturation_fractions),
++        ):
++            storage[:, ptr] = tensor_dict[key].to(torch.float16) if key in tensor_dict.keys() else 0.0
++        self.domain_parameters[:, ptr] = (
++            tensor_dict["domain_parameters"].to(torch.float16)
++            if "domain_parameters" in tensor_dict.keys()
++            else 0.0
++        )
+         if self.asymmetric_obs:
+             critic_observations = tensor_dict["critic_observations"]
+             next_critic_observations = tensor_dict["next"]["critic_observations"]
+
+-            if self.playground_mode:
++            if self.compact_asymmetric:
+                 # Extract and store only the privileged part
+                 privileged_observations = critic_observations[:, self.n_obs :]
+                 next_privileged_observations = next_critic_observations[:, self.n_obs :]
+@@ -119,53 +285,300 @@ class SimpleReplayBuffer(nn.Module):
+                 # Store full critic observations
+                 self.critic_observations[:, ptr] = critic_observations
+                 self.next_critic_observations[:, ptr] = next_critic_observations
++        self._mark_failure_context(ptr, dones, truncations)
+         self.ptr += 1
+
++    def _mark_failure_context(
++        self,
++        ptr: int,
++        dones: torch.Tensor,
++        truncations: torch.Tensor,
++    ) -> None:
++        """Mark a short causal window ending at each physical failure.
++
++        A timeout has both ``done`` and ``truncation`` set and is therefore only
++        an episode boundary, not a failure.  Backtracking stops before an older
++        terminal transition so context never leaks across episodes.
++        """
++
++        failed = dones.bool().reshape(-1) & ~truncations.bool().reshape(-1)
++        failed_envs = torch.nonzero(failed, as_tuple=False).squeeze(-1).tolist()
++        if not failed_envs:
++            return
++        max_back = min(
++            self.failure_context_steps - 1,
++            self.buffer_size - 1,
++            self.ptr if self.ptr < self.buffer_size else self.buffer_size - 1,
++        )
++        for env_id in failed_envs:
++            self.failure_contexts[env_id, ptr] = 1
++            for offset in range(1, max_back + 1):
++                index = (ptr - offset) % self.buffer_size
++                if self.dones[env_id, index] or self.truncations[env_id, index]:
++                    break
++                self.failure_contexts[env_id, index] = 1
++
++    @staticmethod
++    def _quota_counts(total: int, fractions: tuple[float, ...]) -> list[int]:
++        raw = torch.tensor(fractions, dtype=torch.float64) * total
++        counts = torch.floor(raw).to(torch.long)
++        remainder = total - int(counts.sum().item())
++        if remainder > 0:
++            order = torch.argsort(raw - counts, descending=True)
++            counts[order[:remainder]] += 1
++        return [int(value) for value in counts.tolist()]
++
++    @classmethod
++    def _allocate_with_capacities(cls, total: int, capacities: list[int]) -> list[int]:
++        """Allocate an integer quota proportionally without exceeding capacities."""
++
++        allocated = [0 for _ in capacities]
++        remaining = total
++        while remaining > 0:
++            available = [
++                index
++                for index, capacity in enumerate(capacities)
++                if allocated[index] < capacity
++            ]
++            if not available:
++                break
++            spare = [capacities[index] - allocated[index] for index in available]
++            spare_total = sum(spare)
++            proposal = cls._quota_counts(
++                remaining, tuple(value / spare_total for value in spare)
++            )
++            progressed = 0
++            for local_index, index in enumerate(available):
++                addition = min(proposal[local_index], capacities[index] - allocated[index])
++                allocated[index] += addition
++                progressed += addition
++            if progressed == 0:
++                break
++            remaining -= progressed
++        return allocated
++
++    def _draw(self, candidates: torch.Tensor, count: int) -> torch.Tensor:
++        if count <= 0:
++            return torch.empty(0, device=self.device, dtype=torch.long)
++        return candidates[
++            torch.randint(0, candidates.numel(), (count,), device=self.device)
++        ]
++
++    def _fallback_candidates(
++        self,
++        labels: torch.Tensor,
++        requested_band: int,
++        excluded: torch.Tensor,
++    ) -> torch.Tensor:
++        current = torch.nonzero((labels == 3) & ~excluded, as_tuple=False).squeeze(-1)
++        if current.numel() > 0:
++            return current
++        other_impacts = torch.nonzero(
++            (labels > 0) & (labels != requested_band) & ~excluded,
++            as_tuple=False,
++        ).squeeze(-1)
++        if other_impacts.numel() > 0:
++            return other_impacts
++        any_non_excluded = torch.nonzero(~excluded, as_tuple=False).squeeze(-1)
++        if any_non_excluded.numel() > 0:
++            return any_non_excluded
++        return torch.arange(labels.numel(), device=self.device)
++
++    def _sample_stratified_flat(self, total: int, valid: int) -> torch.Tensor:
++        labels = self.curriculum_bands[:, :valid].reshape(-1)
++        phases = self.impact_phases[:, :valid].reshape(-1)
++        failure_flags = self.failure_contexts[:, :valid].reshape(-1).bool()
++        all_quotas = self._quota_counts(
++            total,
++            (*self.band_balance_fractions, self.failure_context_fraction),
++        )
++        quotas = all_quotas[:5]
++        failure_quota = all_quotas[5]
++        impact_total = sum(quotas[1:])
++        active_total = min(impact_total, int(round(total * self.active_impact_fraction)))
++        recovery_total = min(
++            impact_total - active_total,
++            int(round(total * self.recovery_phase_fraction)),
++        )
++        candidates_by_band = [
++            torch.nonzero((labels == band) & ~failure_flags, as_tuple=False).squeeze(-1)
++            for band in range(5)
++        ]
++        active_candidates_by_band = [
++            candidates[phases[candidates] == 2]
++            for candidates in candidates_by_band
++        ]
++        recovery_candidates_by_band = [
++            candidates[phases[candidates] == 3]
++            for candidates in candidates_by_band
++        ]
++        # Reallocate the phase quotas to whichever impact bands currently have
++        # the rare transitions while preserving the five class totals.
++        active_capacities = [
++            quotas[band] if active_candidates_by_band[band].numel() > 0 else 0
++            for band in range(1, 5)
++        ]
++        active_quotas = self._allocate_with_capacities(active_total, active_capacities)
++        recovery_capacities = [
++            max(0, quotas[band] - active_quotas[band - 1])
++            if recovery_candidates_by_band[band].numel() > 0
++            else 0
++            for band in range(1, 5)
++        ]
++        recovery_quotas = self._allocate_with_capacities(
++            recovery_total,
++            recovery_capacities,
++        )
++
++        pieces = []
++        fallback_count = (
++            active_total
++            - sum(active_quotas)
++            + recovery_total
++            - sum(recovery_quotas)
++        )
++        failure_candidates = torch.nonzero(failure_flags, as_tuple=False).squeeze(-1)
++        if failure_quota > 0:
++            if failure_candidates.numel() == 0:
++                failure_candidates = torch.arange(labels.numel(), device=self.device)
++                fallback_count += failure_quota
++            pieces.append(self._draw(failure_candidates, failure_quota))
++
++        for band, quota in enumerate(quotas):
++            if quota <= 0:
++                continue
++            candidates = candidates_by_band[band]
++            if candidates.numel() == 0:
++                candidates = self._fallback_candidates(labels, band, failure_flags)
++                pieces.append(self._draw(candidates, quota))
++                fallback_count += quota
++                continue
++
++            active_quota = active_quotas[band - 1] if band > 0 else 0
++            recovery_quota = recovery_quotas[band - 1] if band > 0 else 0
++            if active_quota > 0:
++                pieces.append(self._draw(active_candidates_by_band[band], active_quota))
++            if recovery_quota > 0:
++                pieces.append(self._draw(recovery_candidates_by_band[band], recovery_quota))
++
++            remaining = quota - active_quota - recovery_quota
++            other_phase = candidates[(phases[candidates] != 2) & (phases[candidates] != 3)]
++            fill_candidates = other_phase if other_phase.numel() > 0 else candidates
++            pieces.append(self._draw(fill_candidates, remaining))
++
++        flat = torch.cat(pieces)
++        flat = flat[torch.randperm(flat.numel(), device=self.device)]
++        sampled_bands = labels[flat]
++        sampled_phases = phases[flat]
++        sampled_failures = failure_flags[flat]
++        names = ("no_impact", "easy", "middle", "current", "probe")
++        self.last_sample_stats = {
++            f"sample_{name}": float(
++                ((sampled_bands == band) & ~sampled_failures).float().mean().item()
++            )
++            for band, name in enumerate(names)
++        }
++        self.last_sample_stats["sample_failure_context"] = float(
++            sampled_failures.float().mean().item()
++        )
++        self.last_sample_stats["sample_impact"] = float(
++            (sampled_bands > 0).float().mean().item()
++        )
++        self.last_sample_stats["sample_active_impact"] = float(
++            (sampled_phases == 2).float().mean().item()
++        )
++        self.last_sample_stats["sample_recovery_phase"] = float(
++            (sampled_phases == 3).float().mean().item()
++        )
++        self.last_sample_stats["fallback_fraction"] = fallback_count / total
++        return flat
++
++    def _sample_indices(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
++        valid = min(self.buffer_size, self.ptr)
++        if valid <= 0:
++            raise RuntimeError("Cannot sample an empty replay buffer")
++        if self.band_balance_fractions is not None:
++            total = self.n_env * batch_size
++            flat = self._sample_stratified_flat(total, valid)
++            return (flat // valid).reshape(self.n_env, batch_size), (flat % valid).reshape(
++                self.n_env, batch_size
++            )
++        if self.event_balance_fraction is None:
++            env_indices = torch.arange(self.n_env, device=self.device).unsqueeze(1).expand(-1, batch_size)
++            time_indices = torch.randint(0, valid, (self.n_env, batch_size), device=self.device)
++            return env_indices, time_indices
++
++        total = self.n_env * batch_size
++        labels = self.event_types[:, :valid].reshape(-1)
++        impact_candidates = torch.nonzero(labels > 0, as_tuple=False).squeeze(-1)
++        clean_candidates = torch.nonzero(labels == 0, as_tuple=False).squeeze(-1)
++        requested_impact = int(round(total * self.event_balance_fraction))
++        if impact_candidates.numel() == 0 or clean_candidates.numel() == 0:
++            flat = torch.randint(0, labels.numel(), (total,), device=self.device)
++        else:
++            impact = impact_candidates[
++                torch.randint(0, impact_candidates.numel(), (requested_impact,), device=self.device)
++            ]
++            clean_count = total - requested_impact
++            clean = clean_candidates[
++                torch.randint(0, clean_candidates.numel(), (clean_count,), device=self.device)
++            ]
++            flat = torch.cat((impact, clean))
++            flat = flat[torch.randperm(total, device=self.device)]
++        return (flat // valid).reshape(self.n_env, batch_size), (flat % valid).reshape(self.n_env, batch_size)
++
+     @torch.no_grad()
+     def sample(self, batch_size: int):
+         # we will sample n_env * batch_size transitions
+
+         if self.n_steps == 1:
+-            indices = torch.randint(
+-                0,
+-                min(self.buffer_size, self.ptr),
+-                (self.n_env, batch_size),
+-                device=self.device,
+-            )
+-            obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
+-            act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
+-            observations = torch.gather(self.observations, 1, obs_indices).reshape(
++            env_indices, indices = self._sample_indices(batch_size)
++            observations = self.observations[env_indices, indices].reshape(self.n_env * batch_size, self.n_obs)
++            next_observations = self.next_observations[env_indices, indices].reshape(
+                 self.n_env * batch_size, self.n_obs
+             )
+-            next_observations = torch.gather(
+-                self.next_observations, 1, obs_indices
+-            ).reshape(self.n_env * batch_size, self.n_obs)
+-            actions = torch.gather(self.actions, 1, act_indices).reshape(
+-                self.n_env * batch_size, self.n_act
++            actions = self.actions[env_indices, indices].reshape(self.n_env * batch_size, self.n_act)
++            rewards = self.rewards[env_indices, indices].reshape(self.n_env * batch_size)
++            dones = self.dones[env_indices, indices].reshape(self.n_env * batch_size)
++            truncations = self.truncations[env_indices, indices].reshape(self.n_env * batch_size)
++            sampled_event_types = self.event_types[env_indices, indices].reshape(self.n_env * batch_size)
++            sampled_curriculum_bands = self.curriculum_bands[env_indices, indices].reshape(
++                self.n_env * batch_size
+             )
+-
+-            rewards = torch.gather(self.rewards, 1, indices).reshape(
++            sampled_impact_phases = self.impact_phases[env_indices, indices].reshape(
++                self.n_env * batch_size
++            )
++            sampled_episode_difficulties = self.episode_difficulties[env_indices, indices].reshape(
+                 self.n_env * batch_size
+             )
+-            dones = torch.gather(self.dones, 1, indices).reshape(
++            sampled_initial_difficulties = self.initial_difficulties[env_indices, indices].reshape(
+                 self.n_env * batch_size
+             )
+-            truncations = torch.gather(self.truncations, 1, indices).reshape(
++            sampled_disturbance_difficulties = self.disturbance_difficulties[env_indices, indices].reshape(
++                self.n_env * batch_size
++            )
++            sampled_motor_saturation_fractions = self.motor_saturation_fractions[env_indices, indices].reshape(
++                self.n_env * batch_size
++            )
++            sampled_domain_parameters = self.domain_parameters[env_indices, indices].reshape(
++                self.n_env * batch_size, 8
++            )
++            sampled_failure_contexts = self.failure_contexts[env_indices, indices].reshape(
+                 self.n_env * batch_size
+             )
+             effective_n_steps = torch.ones_like(dones)
+             if self.asymmetric_obs:
+-                if self.playground_mode:
++                if self.compact_asymmetric:
+                     # Gather privileged observations
+                     priv_obs_indices = indices.unsqueeze(-1).expand(
+                         -1, -1, self.privileged_obs_size
+                     )
+-                    privileged_observations = torch.gather(
+-                        self.privileged_observations, 1, priv_obs_indices
+-                    ).reshape(self.n_env * batch_size, self.privileged_obs_size)
+-                    next_privileged_observations = torch.gather(
+-                        self.next_privileged_observations, 1, priv_obs_indices
+-                    ).reshape(self.n_env * batch_size, self.privileged_obs_size)
++                    privileged_observations = self.privileged_observations[env_indices, indices].reshape(
++                        self.n_env * batch_size, self.privileged_obs_size
++                    )
++                    next_privileged_observations = self.next_privileged_observations[env_indices, indices].reshape(
++                        self.n_env * batch_size, self.privileged_obs_size
++                    )
+
+                     # Concatenate with regular observations to form full critic observations
+                     critic_observations = torch.cat(
+@@ -223,7 +636,7 @@ class SimpleReplayBuffer(nn.Module):
+                 self.n_env * batch_size, self.n_act
+             )
+             if self.asymmetric_obs:
+-                if self.playground_mode:
++                if self.compact_asymmetric:
+                     # Gather privileged observations
+                     priv_obs_indices = indices.unsqueeze(-1).expand(
+                         -1, -1, self.privileged_obs_size
+@@ -326,7 +739,7 @@ class SimpleReplayBuffer(nn.Module):
+             final_truncations = self.truncations.gather(1, final_next_obs_indices)
+
+             if self.asymmetric_obs:
+-                if self.playground_mode:
++                if self.compact_asymmetric:
+                     # Gather final privileged observations
+                     final_next_privileged_observations = (
+                         self.next_privileged_observations.gather(
+@@ -392,12 +805,137 @@ class SimpleReplayBuffer(nn.Module):
+         if self.asymmetric_obs:
+             out["critic_observations"] = critic_observations
+             out["next"]["critic_observations"] = next_critic_observations
++        if self.n_steps == 1:
++            out["event_type"] = sampled_event_types
++            out["curriculum_band"] = sampled_curriculum_bands
++            out["impact_phase"] = sampled_impact_phases
++            out["episode_difficulty"] = sampled_episode_difficulties
++            out["initial_difficulty"] = sampled_initial_difficulties
++            out["disturbance_difficulty"] = sampled_disturbance_difficulties
++            out["motor_saturation_fraction"] = sampled_motor_saturation_fractions
++            out["domain_parameters"] = sampled_domain_parameters
++            out["failure_context"] = sampled_failure_contexts
+
+         if self.n_steps > 1 and self.ptr >= self.buffer_size:
+             # Roll back the truncation flags introduced for safe sampling
+             self.truncations[:, current_pos - 1] = curr_truncations
+         return out
+
++    @torch.no_grad()
++    def diagnostics(self) -> dict[str, float]:
++        valid = min(self.buffer_size, self.ptr)
++        diagnostics = {
++            "occupancy_no_impact": 0.0,
++            "occupancy_easy": 0.0,
++            "occupancy_middle": 0.0,
++            "occupancy_current": 0.0,
++            "occupancy_probe": 0.0,
++            "occupancy_failure_context": 0.0,
++            "occupancy_active_impact": 0.0,
++            "occupancy_recovery_phase": 0.0,
++            "legacy_metadata": float(self.legacy_metadata),
++        }
++        if valid <= 0:
++            return diagnostics
++        bands = self.curriculum_bands[:, :valid]
++        phases = self.impact_phases[:, :valid]
++        failures = self.failure_contexts[:, :valid].bool()
++        names = ("no_impact", "easy", "middle", "current", "probe")
++        for band, name in enumerate(names):
++            diagnostics[f"occupancy_{name}"] = float(
++                ((bands == band) & ~failures).float().mean().item()
++            )
++        diagnostics["occupancy_failure_context"] = float(failures.float().mean().item())
++        diagnostics["occupancy_active_impact"] = float((phases == 2).float().mean().item())
++        diagnostics["occupancy_recovery_phase"] = float((phases == 3).float().mean().item())
++        return diagnostics
++
++    def checkpoint_state(self) -> dict:
++        """Return a CPU replay snapshot for optional long-milestone checkpoints."""
++        state = {
++            "replay_metadata_version": 4,
++            "ptr": self.ptr,
++            "observations": self.observations.detach().cpu(),
++            "actions": self.actions.detach().cpu(),
++            "rewards": self.rewards.detach().cpu(),
++            "dones": self.dones.detach().cpu(),
++            "truncations": self.truncations.detach().cpu(),
++            "next_observations": self.next_observations.detach().cpu(),
++            "event_types": self.event_types.detach().cpu(),
++            "curriculum_bands": self.curriculum_bands.detach().cpu(),
++            "impact_phases": self.impact_phases.detach().cpu(),
++            "episode_difficulties": self.episode_difficulties.detach().cpu(),
++            "initial_difficulties": self.initial_difficulties.detach().cpu(),
++            "disturbance_difficulties": self.disturbance_difficulties.detach().cpu(),
++            "motor_saturation_fractions": self.motor_saturation_fractions.detach().cpu(),
++            "domain_parameters": self.domain_parameters.detach().cpu(),
++            "failure_contexts": self.failure_contexts.detach().cpu(),
++            "band_balance_fractions": self.band_balance_fractions,
++            "failure_context_fraction": self.failure_context_fraction,
++            "failure_context_steps": self.failure_context_steps,
++            "active_impact_fraction": self.active_impact_fraction,
++            "recovery_phase_fraction": self.recovery_phase_fraction,
++        }
++        if self.asymmetric_obs:
++            state["privileged_observations"] = self.privileged_observations.detach().cpu()
++            state["next_privileged_observations"] = self.next_privileged_observations.detach().cpu()
++        return state
++
++    @torch.no_grad()
++    def load_checkpoint_state(self, state: dict) -> None:
++        self.ptr = int(state["ptr"])
++        tensor_names = (
++            "observations",
++            "actions",
++            "rewards",
++            "dones",
++            "truncations",
++            "next_observations",
++            "event_types",
++            "privileged_observations",
++            "next_privileged_observations",
++            "curriculum_bands",
++            "impact_phases",
++            "episode_difficulties",
++            "initial_difficulties",
++            "disturbance_difficulties",
++            "motor_saturation_fractions",
++            "domain_parameters",
++            "failure_contexts",
++        )
++        for name in tensor_names:
++            if name == "curriculum_bands":
++                continue
++            if name in state and hasattr(self, name):
++                getattr(self, name).copy_(state[name].to(self.device))
++
++        if "curriculum_bands" not in state:
++            self.curriculum_bands.copy_((self.event_types > 0).to(torch.uint8) * 3)
++            self.impact_phases.zero_()
++            self.episode_difficulties.zero_()
++            self.legacy_metadata = True
++        else:
++            bands = state["curriculum_bands"].to(self.device, dtype=torch.uint8)
++            if int(state.get("replay_metadata_version", 1)) < 2:
++                migrated = bands.clone()
++                migrated[bands == 2] = 3
++                migrated[bands == 3] = 4
++                bands = migrated
++                self.legacy_metadata = True
++            else:
++                self.legacy_metadata = False
++            self.curriculum_bands.copy_(bands)
++        if "failure_contexts" not in state:
++            self.failure_contexts.zero_()
++        for name in (
++            "initial_difficulties",
++            "disturbance_difficulties",
++            "motor_saturation_fractions",
++            "domain_parameters",
++        ):
++            if name not in state:
++                getattr(self, name).zero_()
++
+
+ class EmpiricalNormalization(nn.Module):
+     """Normalize mean and variance of values based on empirical values."""
+@@ -761,6 +1299,14 @@ def save_params(
+     critic_obs_normalizer,
+     args,
+     save_path,
++    *,
++    actor_optimizer=None,
++    q_optimizer=None,
++    actor_scheduler=None,
++    q_scheduler=None,
++    reward_normalizer=None,
++    training_state=None,
++    replay_buffer=None,
+ ):
+     """Save model parameters and training configuration to disk."""
+
+@@ -787,6 +1333,21 @@ def save_params(
+         ),
+         "args": vars(args),  # Save all arguments
+         "global_step": global_step,
++        "actor_optimizer_state": actor_optimizer.state_dict() if actor_optimizer is not None else None,
++        "q_optimizer_state": q_optimizer.state_dict() if q_optimizer is not None else None,
++        "actor_scheduler_state": actor_scheduler.state_dict() if actor_scheduler is not None else None,
++        "q_scheduler_state": q_scheduler.state_dict() if q_scheduler is not None else None,
++        "reward_normalizer_state": (
++            cpu_state(reward_normalizer.state_dict())
++            if reward_normalizer is not None and hasattr(reward_normalizer, "state_dict")
++            else None
++        ),
++        "training_state": training_state,
++        "replay_buffer_state": (
++            replay_buffer.checkpoint_state()
++            if replay_buffer is not None and hasattr(replay_buffer, "checkpoint_state")
++            else None
++        ),
+     }
+     torch.save(save_dict, save_path, _use_new_zipfile_serialization=True)
+     print(f"Saved parameters and configuration to {save_path}")
+diff --git a/fast_td3/fixed_impact_evaluation.py b/fast_td3/fixed_impact_evaluation.py
+new file mode 100644
+index 0000000..5dd7831
+--- /dev/null
++++ b/fast_td3/fixed_impact_evaluation.py
+@@ -0,0 +1,343 @@
++"""Deterministic checkpoint evaluation for FlightLxx's five fixed impacts."""
++
++from __future__ import annotations
++
++import csv
++import json
++import math
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Callable, Mapping
++
++import torch
++
++from flightlxx_isaaclab.evaluation import (
++    FixedImpactProtocol,
++    ImpactRecoveryTracker,
++    load_fixed_protocol,
++    protocol_for_single_impact,
++    protocol_to_dict,
++)
++
++
++@dataclass(frozen=True)
++class EvaluationArtifactPaths:
++    json_path: Path
++    timeseries_path: Path
++    summary_csv: Path
++
++
++_SUMMARY_FIELDS = (
++    "checkpoint_step",
++    "passed",
++    "recovered_count",
++    "independent_passed",
++    "independent_recovered_count",
++    "independent_crashed",
++    "sequential_passed",
++    "sequential_recovered_count",
++    "sequential_crashed",
++    "crashed",
++    "max_position_error",
++    "max_attitude_error_rad",
++    "max_linear_speed",
++    "max_angular_speed",
++    "final_steady_position_error",
++)
++
++
++def write_evaluation_artifacts(output_dir: str | Path, step: int, result: Mapping[str, Any]) -> EvaluationArtifactPaths:
++    """Persist one immutable checkpoint result plus a run-level CSV index."""
++
++    evaluation_dir = Path(output_dir) / "evaluation"
++    timeseries_dir = evaluation_dir / "timeseries"
++    timeseries_dir.mkdir(parents=True, exist_ok=True)
++    json_path = evaluation_dir / f"step_{step:08d}.json"
++    timeseries_path = timeseries_dir / f"step_{step:08d}.csv"
++    summary_csv = evaluation_dir / "summary.csv"
++    payload = {"checkpoint_step": int(step), **dict(result)}
++    modes = result.get("modes", {})
++    for mode in ("independent", "sequential"):
++        mode_result = modes.get(mode, {})
++        payload.setdefault(f"{mode}_passed", mode_result.get("passed"))
++        payload.setdefault(
++            f"{mode}_recovered_count", mode_result.get("recovered_count")
++        )
++        payload.setdefault(f"{mode}_crashed", mode_result.get("crashed"))
++    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
++
++    rows = list(result.get("time_series", []))
++    fields = sorted({key for row in rows for key in row}) or ["time_s"]
++    with timeseries_path.open("w", newline="", encoding="utf-8") as handle:
++        writer = csv.DictWriter(handle, fieldnames=fields)
++        writer.writeheader()
++        writer.writerows(rows)
++
++    summary_row = {name: payload.get(name) for name in _SUMMARY_FIELDS}
++    write_header = not summary_csv.exists()
++    with summary_csv.open("a", newline="", encoding="utf-8") as handle:
++        writer = csv.DictWriter(handle, fieldnames=_SUMMARY_FIELDS)
++        if write_header:
++            writer.writeheader()
++        writer.writerow(summary_row)
++    return EvaluationArtifactPaths(json_path, timeseries_path, summary_csv)
++
++
++def _scalar(metrics: Mapping[str, Any], key: str) -> float:
++    value = metrics[key]
++    if isinstance(value, torch.Tensor):
++        return float(value[0].detach().item())
++    return float(value)
++
++
++def _steady_rms(
++    time_series: list[dict[str, float | bool | str]],
++    window_s: float,
++) -> dict[str, float | None]:
++    """Compute terminal-window RMS from pre-reset telemetry only."""
++
++    metric_keys = (
++        "position_error",
++        "linear_speed",
++        "attitude_error_rad",
++        "angular_speed",
++    )
++    if not time_series:
++        return {key: None for key in metric_keys}
++    end_time = float(time_series[-1]["time_s"])
++    start_time = end_time - window_s
++    rows = [row for row in time_series if float(row["time_s"]) > start_time + 1.0e-9]
++    return {
++        key: math.sqrt(sum(float(row[key]) ** 2 for row in rows) / len(rows))
++        for key in metric_keys
++    }
++
++
++def _run_protocol(
++    env: Any,
++    raw_env: Any,
++    actor: Any,
++    normalize_obs: Callable[..., torch.Tensor],
++    protocol: FixedImpactProtocol,
++    *,
++    mode: str,
++    trial_impact_id: str | None,
++    on_step: Callable[[Mapping[str, Any]], None] | None,
++) -> dict[str, Any]:
++    raw_env.begin_fixed_evaluation(protocol)
++    tracker = ImpactRecoveryTracker(protocol)
++    time_series: list[dict[str, float | bool | str]] = []
++    crashed = False
++    invalid_early_truncation = False
++    maxima = {
++        "position_error": 0.0,
++        "attitude_error_rad": 0.0,
++        "linear_speed": 0.0,
++        "angular_speed": 0.0,
++    }
++    try:
++        observations = env.reset(random_start_init=False)
++        total_steps = math.ceil(protocol.total_duration_s / raw_env.step_dt)
++        for step_index in range(total_steps):
++            with torch.no_grad():
++                normalized = normalize_obs(observations, update=False)
++                if hasattr(actor, "explore"):
++                    actions = actor.explore(normalized, deterministic=True)
++                else:
++                    actions = actor(normalized)
++            observations, _, dones, _ = env.step(actions.float())
++            metrics_tensor = raw_env.evaluation_step_metrics()
++            if not metrics_tensor:
++                raise RuntimeError("evaluation environment did not publish step metrics")
++            scalar_metrics = {
++                key: _scalar(metrics_tensor, key)
++                for key in metrics_tensor
++                if key != "failure"
++            }
++            metrics = {key: scalar_metrics[key] for key in protocol.thresholds}
++            failure = bool(metrics_tensor["failure"][0].item())
++            time_s = (step_index + 1) * raw_env.step_dt
++            completed_impacts = tracker.step(time_s, metrics, failure)
++            row: dict[str, float | bool | str] = {
++                "mode": mode,
++                "trial_impact_id": trial_impact_id or "",
++                "time_s": time_s,
++                **scalar_metrics,
++                "failure": failure,
++            }
++            time_series.append(row)
++            if on_step is not None:
++                on_step(
++                    {
++                        "mode": mode,
++                        "trial_impact_id": trial_impact_id,
++                        "time_s": time_s,
++                        "metrics": scalar_metrics,
++                        "actions": actions.detach(),
++                        "completed_impacts": completed_impacts,
++                        "failure": failure,
++                    }
++                )
++            for key in maxima:
++                maxima[key] = max(maxima[key], metrics[key])
++
++            done = bool(dones[0].item()) if isinstance(dones, torch.Tensor) else bool(dones)
++            if done and step_index + 1 < total_steps:
++                invalid_early_truncation = True
++                break
++            if failure:
++                crashed = True
++                break
++
++        steady = _steady_rms(time_series, protocol.recovery_dwell_s)
++        steady_safe = all(
++            steady[key] is not None and float(steady[key]) < limit
++            for key, limit in protocol.thresholds.items()
++        )
++        records = [dict(record) for record in tracker.records]
++        if len(records) == 1:
++            records[0].update(
++                {
++                    "max_position_error": maxima["position_error"],
++                    "max_attitude_error_rad": maxima["attitude_error_rad"],
++                    "max_linear_speed": maxima["linear_speed"],
++                    "max_angular_speed": maxima["angular_speed"],
++                    "steady_position_error_rms": steady["position_error"],
++                }
++            )
++        return {
++            "protocol": protocol_to_dict(protocol),
++            "passed": (
++                tracker.complete
++                and all(record["recovered"] for record in records)
++                and not crashed
++                and not invalid_early_truncation
++                and steady_safe
++            ),
++            "recovered_count": sum(bool(record["recovered"]) for record in records),
++            "crashed": crashed,
++            "invalid_early_truncation": invalid_early_truncation,
++            "max_position_error": maxima["position_error"],
++            "max_attitude_error_rad": maxima["attitude_error_rad"],
++            "max_linear_speed": maxima["linear_speed"],
++            "max_angular_speed": maxima["angular_speed"],
++            "steady_position_error_rms": steady["position_error"],
++            "steady_linear_speed_rms": steady["linear_speed"],
++            "steady_attitude_error_rad_rms": steady["attitude_error_rad"],
++            "steady_angular_speed_rms": steady["angular_speed"],
++            "final_steady_position_error": steady["position_error"],
++            "impact_records": records,
++            "time_series": time_series,
++        }
++    finally:
++        raw_env.end_fixed_evaluation()
++
++
++def _aggregate_independent(trials: list[dict[str, Any]]) -> dict[str, Any]:
++    records = [record for trial in trials for record in trial["impact_records"]]
++    time_series = [row for trial in trials for row in trial["time_series"]]
++
++    def maximum(name: str) -> float:
++        return max((float(trial[name]) for trial in trials), default=0.0)
++
++    steady_values = [
++        float(trial["steady_position_error_rms"])
++        for trial in trials
++        if trial["steady_position_error_rms"] is not None
++    ]
++    return {
++        "passed": len(trials) == 5 and all(bool(trial["passed"]) for trial in trials),
++        "recovered_count": sum(bool(record["recovered"]) for record in records),
++        "crashed": any(bool(trial["crashed"]) for trial in trials),
++        "invalid_early_truncation": any(
++            bool(trial["invalid_early_truncation"]) for trial in trials
++        ),
++        "max_position_error": maximum("max_position_error"),
++        "max_attitude_error_rad": maximum("max_attitude_error_rad"),
++        "max_linear_speed": maximum("max_linear_speed"),
++        "max_angular_speed": maximum("max_angular_speed"),
++        "steady_position_error_rms": max(steady_values, default=None),
++        "final_steady_position_error": max(steady_values, default=None),
++        "impact_records": records,
++        "time_series": time_series,
++        "trials": trials,
++    }
++
++
++def evaluate_fixed_five_impacts(
++    env: Any,
++    actor: Any,
++    normalize_obs: Callable[..., torch.Tensor],
++    checkpoint_step: int,
++    output_dir: str | Path,
++    on_step: Callable[[Mapping[str, Any]], None] | None = None,
++    protocol: FixedImpactProtocol | None = None,
++) -> dict[str, Any]:
++    """Evaluate deterministic actor actions without touching training state.
++
++    ``env`` is the FastTD3 IsaacLab wrapper.  No replay buffer, optimizer,
++    normalizer update, curriculum update, or exploration noise is invoked.
++    """
++
++    if protocol is None:
++        package_root = Path(__import__("flightlxx_isaaclab").__file__).parent
++        protocol = load_fixed_protocol(package_root / "config" / "fixed_five_impacts.json")
++    raw_env = env.envs.unwrapped
++    try:
++        independent_trials = [
++            _run_protocol(
++                env,
++                raw_env,
++                actor,
++                normalize_obs,
++                protocol_for_single_impact(protocol, index),
++                mode="independent",
++                trial_impact_id=impact.impact_id,
++                on_step=on_step,
++            )
++            for index, impact in enumerate(protocol.impacts)
++        ]
++        independent = _aggregate_independent(independent_trials)
++        sequential = _run_protocol(
++            env,
++            raw_env,
++            actor,
++            normalize_obs,
++            protocol,
++            mode="sequential",
++            trial_impact_id=None,
++            on_step=on_step,
++        )
++        result: dict[str, Any] = {
++            "protocol": protocol_to_dict(protocol),
++            "passed": bool(independent["passed"] and sequential["passed"]),
++            "modes": {"independent": independent, "sequential": sequential},
++            # Backward-compatible top-level fields remain the sequential stress
++            # result while explicit fields expose both modes.
++            "recovered_count": sequential["recovered_count"],
++            "independent_recovered_count": independent["recovered_count"],
++            "sequential_recovered_count": sequential["recovered_count"],
++            "crashed": bool(independent["crashed"] or sequential["crashed"]),
++            "max_position_error": max(
++                independent["max_position_error"], sequential["max_position_error"]
++            ),
++            "max_attitude_error_rad": max(
++                independent["max_attitude_error_rad"], sequential["max_attitude_error_rad"]
++            ),
++            "max_linear_speed": max(
++                independent["max_linear_speed"], sequential["max_linear_speed"]
++            ),
++            "max_angular_speed": max(
++                independent["max_angular_speed"], sequential["max_angular_speed"]
++            ),
++            "final_steady_position_error": sequential["steady_position_error_rms"],
++            "impact_records": sequential["impact_records"],
++            "time_series": independent["time_series"] + sequential["time_series"],
++        }
++        paths = write_evaluation_artifacts(output_dir, checkpoint_step, result)
++        result.update({"json_path": str(paths.json_path), "timeseries_path": str(paths.timeseries_path)})
++        return result
++    finally:
++        # This reset has a guard in the task so evaluation cannot update the
++        # training curriculum or episode metrics.
++        env.reset(random_start_init=False)
+diff --git a/fast_td3/hyperparams.py b/fast_td3/hyperparams.py
+index 04c111e..7834b94 100644
+--- a/fast_td3/hyperparams.py
++++ b/fast_td3/hyperparams.py
+@@ -26,7 +26,13 @@ class BaseArgs:
+     """the project name"""
+     use_wandb: bool = True
+     """whether to use wandb"""
+-    checkpoint_path: str = None
++    output_root: str = "outputs"
++    """root directory for timestamped logs, TensorBoard events, and checkpoints"""
++    use_tensorboard: bool = True
++    """write local TensorBoard events in addition to progress.csv"""
++    log_interval: int = 100
++    """vector-environment steps between local metric records"""
++    checkpoint_path: str | None = None
+     """the path to the checkpoint file"""
+     num_envs: int = 128
+     """the number of environments to run in parallel"""
+@@ -124,6 +130,22 @@ class BaseArgs:
+     """the weight decay of the optimizer"""
+     save_interval: int = 5000
+     """the interval to save the model"""
++    event_balance_fraction: float | None = None
++    """fraction of impact transitions in a replay sample; None keeps uniform sampling"""
++    band_balance_fractions: tuple[float, float, float, float, float] | None = None
++    """fractions for no-impact, easy, middle, current, and probe Replay samples"""
++    failure_context_fraction: float = 0.0
++    """fraction reserved for transitions immediately preceding a physical failure"""
++    failure_context_steps: int = 50
++    """maximum causal failure-context length, in control steps"""
++    active_impact_fraction: float = 0.0
++    """minimum target fraction of active-impact transitions in a Replay sample"""
++    recovery_phase_fraction: float = 0.0
++    """minimum target fraction of early post-impact recovery transitions"""
++    checkpoint_replay: bool = False
++    """include the large replay tensor snapshot only for long-milestone checkpoints"""
++    target_noise_scale: tuple[float, ...] = (1.0,)
++    """per-action target-policy smoothing scale for [thrust, roll rate, pitch rate, yaw rate]"""
+
+     sim_type: str = ""
+     """SimNorm mode: '', sim_actor, sim_critic, or sim_both"""
+@@ -183,6 +205,7 @@ def get_args():
+         "Isaac-Velocity-Rough-G1-v0": IsaacVelocityRoughG1Args,
+         "Isaac-Repose-Cube-Allegro-Direct-v0": IsaacReposeCubeAllegroDirectArgs,
+         "Isaac-Repose-Cube-Shadow-Direct-v0": IsaacReposeCubeShadowDirectArgs,
++        "Isaac-FlightLxx-CTBR-Recovery-Direct-v0": FlightLxxCTBRArgs,
+         # MTBench
+         "MTBench-meta-world-v2-mt10": MetaWorldMT10Args,
+         "MTBench-meta-world-v2-mt50": MetaWorldMT50Args,
+@@ -448,7 +471,46 @@ class IsaacLabArgs(BaseArgs):
+     std_max: float = 0.4
+     num_atoms: int = 251
+     render_interval: int = 0  # IsaacLab does not support rendering in our codebase
+-    total_timesteps: int = 100000
++    total_timesteps: int = 250000
++
++
++@dataclass
++class FlightLxxCTBRArgs(IsaacLabArgs):
++    """RTX 4090 baseline adapted from the official FastTD3 Isaac Lab defaults."""
++
++    env_name: str = "Isaac-FlightLxx-CTBR-Recovery-Direct-v0"
++    num_envs: int = 1024
++    num_eval_envs: int = 1024
++    buffer_size: int = 3072
++    batch_size: int = 24576
++    num_atoms: int = 251
++    v_min: float = -10.0
++    v_max: float = 10.0
++    gamma: float = 0.99
++    tau: float = 0.1
++    policy_noise: float = 0.001
++    noise_clip: float = 0.5
++    std_min: float = 0.05
++    std_max: float = 0.20
++    target_noise_scale: tuple[float, ...] = (0.75, 1.0, 1.0, 0.75)
++    event_balance_fraction: float | None = None
++    band_balance_fractions: tuple[float, float, float, float, float] | None = (
++        0.10,
++        0.15,
++        0.20,
++        0.35,
++        0.10,
++    )
++    failure_context_fraction: float = 0.10
++    failure_context_steps: int = 50
++    active_impact_fraction: float = 0.05
++    recovery_phase_fraction: float = 0.20
++    use_grad_norm_clipping: bool = True
++    max_grad_norm: float = 10.0
++    compile: bool = False
++    log_interval: int = 100
++    save_interval: int = 25000
++    total_timesteps: int = 250000
+
+
+ @dataclass
+diff --git a/fast_td3/local_logging.py b/fast_td3/local_logging.py
+new file mode 100644
+index 0000000..364ed47
+--- /dev/null
++++ b/fast_td3/local_logging.py
+@@ -0,0 +1,197 @@
++"""Local, reproducible training artifacts for FastTD3 runs.
++
++The upstream implementation treats Weights & Biases as the only metric sink and
++stores all checkpoints in one global directory.  This module keeps every run in
++its own timestamped directory and always provides a plain CSV log.  TensorBoard
++is enabled when its optional dependency is available.
++"""
++
++from __future__ import annotations
++
++import csv
++import json
++import math
++import re
++import sys
++from dataclasses import dataclass
++from datetime import datetime
++from pathlib import Path
++from typing import Any, Mapping, TextIO
++
++
++@dataclass(frozen=True)
++class RunPaths:
++    run_dir: Path
++    logs_dir: Path
++    tensorboard_dir: Path
++    checkpoints_dir: Path
++    progress_csv: Path
++    config_json: Path
++
++
++def _safe_component(value: str) -> str:
++    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
++    return cleaned or "run"
++
++
++def create_run_paths(
++    output_root: str | Path,
++    env_name: str,
++    seed: int,
++    now: datetime | None = None,
++) -> RunPaths:
++    """Create one collision-safe, timestamped artifact directory."""
++
++    timestamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
++    parent = Path(output_root).expanduser() / _safe_component(env_name)
++    base_name = f"{timestamp}_seed{seed}"
++    run_dir = parent / base_name
++    collision = 1
++    while run_dir.exists():
++        run_dir = parent / f"{base_name}_{collision:02d}"
++        collision += 1
++
++    logs_dir = run_dir / "logs"
++    tensorboard_dir = run_dir / "tensorboard"
++    checkpoints_dir = run_dir / "checkpoints"
++    for directory in (logs_dir, tensorboard_dir, checkpoints_dir):
++        directory.mkdir(parents=True, exist_ok=False)
++
++    return RunPaths(
++        run_dir=run_dir,
++        logs_dir=logs_dir,
++        tensorboard_dir=tensorboard_dir,
++        checkpoints_dir=checkpoints_dir,
++        progress_csv=logs_dir / "progress.csv",
++        config_json=run_dir / "config.json",
++    )
++
++
++def _scalar(value: Any) -> float | int | None:
++    """Convert Python/NumPy/Torch scalar-like values without importing Torch."""
++
++    if isinstance(value, bool):
++        return int(value)
++    if isinstance(value, (int, float)):
++        scalar = value
++    elif hasattr(value, "numel") and callable(value.numel):
++        if value.numel() != 1:
++            return None
++        scalar = value.detach().item() if hasattr(value, "detach") else value.item()
++    elif hasattr(value, "item") and callable(value.item):
++        try:
++            scalar = value.item()
++        except (TypeError, ValueError):
++            return None
++    else:
++        return None
++    if isinstance(scalar, (int, float)) and math.isfinite(float(scalar)):
++        return scalar
++    return None
++
++
++class _DynamicCsvWriter:
++    """Wide CSV writer whose schema can grow when Isaac Lab emits new metrics."""
++
++    def __init__(self, path: Path):
++        self.path = path
++        self.fieldnames: list[str] = []
++
++    def write(self, row: Mapping[str, float | int]) -> None:
++        new_fields = [name for name in row if name not in self.fieldnames]
++        if not self.fieldnames:
++            self.fieldnames = list(row)
++            self._rewrite([dict(row)])
++            return
++        if new_fields:
++            existing = []
++            with self.path.open(newline="", encoding="utf-8") as handle:
++                existing.extend(csv.DictReader(handle))
++            self.fieldnames.extend(new_fields)
++            existing.append(dict(row))
++            self._rewrite(existing)
++            return
++        with self.path.open("a", newline="", encoding="utf-8") as handle:
++            writer = csv.DictWriter(handle, fieldnames=self.fieldnames)
++            writer.writerow(row)
++
++    def _rewrite(self, rows: list[Mapping[str, Any]]) -> None:
++        with self.path.open("w", newline="", encoding="utf-8") as handle:
++            writer = csv.DictWriter(handle, fieldnames=self.fieldnames)
++            writer.writeheader()
++            writer.writerows(rows)
++
++
++class LocalTrainingLogger:
++    """Write console, progress.csv and TensorBoard metrics for one run."""
++
++    _CONSOLE_PRIORITY = (
++        "frame",
++        "train/sample_sps",
++        "env_rewards",
++        "episode_return_mean",
++        "episode_length_mean",
++        "actor_loss",
++        "qf_loss",
++        "q1_q2_gap",
++        "support_boundary_probability",
++        "Curriculum/difficulty",
++        "Metrics/success_recovery",
++        "Metrics/post_impact_crash_rate",
++    )
++
++    def __init__(
++        self,
++        paths: RunPaths,
++        config: Mapping[str, Any],
++        *,
++        enable_tensorboard: bool = True,
++        stream: TextIO | None = None,
++        summary_writer: Any | None = None,
++    ):
++        self.paths = paths
++        self.stream = stream or sys.stdout
++        self.csv = _DynamicCsvWriter(paths.progress_csv)
++        self.closed = False
++        paths.config_json.write_text(
++            json.dumps(dict(config), indent=2, ensure_ascii=False, default=str) + "\n",
++            encoding="utf-8",
++        )
++        self.summary_writer = summary_writer
++        if self.summary_writer is None and enable_tensorboard:
++            try:
++                from torch.utils.tensorboard import SummaryWriter
++
++                self.summary_writer = SummaryWriter(log_dir=str(paths.tensorboard_dir))
++            except (ImportError, ModuleNotFoundError) as exc:
++                print(f"TensorBoard disabled: {exc}", file=self.stream)
++
++    def log(self, step: int, metrics: Mapping[str, Any]) -> None:
++        scalars: dict[str, float | int] = {"step": int(step)}
++        for name, value in metrics.items():
++            scalar = _scalar(value)
++            if scalar is not None:
++                scalars[name] = scalar
++        self.csv.write(scalars)
++
++        if self.summary_writer is not None:
++            for name, value in scalars.items():
++                if name != "step":
++                    self.summary_writer.add_scalar(name, value, step)
++            self.summary_writer.flush()
++
++        visible = [
++            f"{name}={float(scalars[name]):.5g}"
++            for name in self._CONSOLE_PRIORITY
++            if name in scalars
++        ]
++        print(f"[train] step {step}: " + ", ".join(visible), file=self.stream)
++
++    def close(self) -> None:
++        if self.closed:
++            return
++        if self.summary_writer is not None:
++            self.summary_writer.flush()
++            self.summary_writer.close()
++        self.closed = True
++
+diff --git a/fast_td3/round_reporting.py b/fast_td3/round_reporting.py
+new file mode 100644
+index 0000000..814db7b
+--- /dev/null
++++ b/fast_td3/round_reporting.py
+@@ -0,0 +1,105 @@
++"""Self-contained per-round reports from local FastTD3 artifacts."""
++
++from __future__ import annotations
++
++import csv
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++
++@dataclass(frozen=True)
++class RoundReportPaths:
++    markdown: Path
++    summary_csv: Path
++    training_reward_png: Path
++    recovery_png: Path
++
++
++def _read_csv(path: Path) -> list[dict[str, str]]:
++    if not path.exists():
++        return []
++    with path.open(newline="", encoding="utf-8") as handle:
++        return list(csv.DictReader(handle))
++
++
++def _number(row: dict[str, str], key: str, default: float = 0.0) -> float:
++    try:
++        return float(row.get(key, default))
++    except (TypeError, ValueError):
++        return default
++
++
++def _plot_training(rows: list[dict[str, str]], path: Path) -> None:
++    import matplotlib
++
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++
++    fig, axis = plt.subplots(figsize=(7, 3.5))
++    axis.plot([_number(row, "step") for row in rows], [_number(row, "train/reward") for row in rows])
++    axis.set(xlabel="global step", ylabel="mean environment reward", title="Training reward")
++    axis.grid(alpha=0.3)
++    fig.tight_layout()
++    fig.savefig(path, dpi=160)
++    plt.close(fig)
++
++
++def _plot_recovery(rows: list[dict[str, str]], path: Path) -> None:
++    import matplotlib
++
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++
++    steps = [_number(row, "checkpoint_step") for row in rows]
++    recovered = [_number(row, "recovered_count") for row in rows]
++    crashed = [_number(row, "crashed") for row in rows]
++    fig, axis = plt.subplots(figsize=(7, 3.5))
++    axis.plot(steps, recovered, marker="o", label="recovered impacts / 5")
++    axis.plot(steps, crashed, marker="x", label="crashed (1=yes)")
++    axis.set(xlabel="checkpoint step", ylabel="count / flag", title="Fixed five-impact evaluation")
++    axis.set_ylim(-0.2, 5.2)
++    axis.grid(alpha=0.3)
++    axis.legend()
++    fig.tight_layout()
++    fig.savefig(path, dpi=160)
++    plt.close(fig)
++
++
++def write_round_report(run_dir: str | Path) -> RoundReportPaths:
++    """Generate a concise round report; input data are never modified."""
++
++    run_dir = Path(run_dir)
++    reports_dir = run_dir / "reports"
++    reports_dir.mkdir(parents=True, exist_ok=True)
++    training_rows = _read_csv(run_dir / "logs" / "progress.csv")
++    evaluation_rows = _read_csv(run_dir / "evaluation" / "summary.csv")
++    summary_csv = reports_dir / "summary.csv"
++    with summary_csv.open("w", newline="", encoding="utf-8") as handle:
++        if evaluation_rows:
++            writer = csv.DictWriter(handle, fieldnames=list(evaluation_rows[0]))
++            writer.writeheader()
++            writer.writerows(evaluation_rows)
++        else:
++            handle.write("checkpoint_step,passed,recovered_count,crashed\n")
++
++    training_png = reports_dir / "training_reward.png"
++    recovery_png = reports_dir / "five_impact_recovery.png"
++    _plot_training(training_rows, training_png)
++    _plot_recovery(evaluation_rows, recovery_png)
++    best = max(evaluation_rows, key=lambda row: (_number(row, "recovered_count"), -_number(row, "crashed")), default=None)
++    markdown = reports_dir / "round_report.md"
++    markdown.write_text(
++        "# FastTD3 fixed-five-impact round report\n\n"
++        f"- Training log records: {len(training_rows)}\n"
++        f"- Checkpoint evaluations: {len(evaluation_rows)}\n"
++        + (
++            f"- Best checkpoint: {best.get('checkpoint_step')} "
++            f"({best.get('recovered_count')}/5 recovered, passed={best.get('passed')})\n"
++            if best is not None
++            else "- Best checkpoint: none\n"
++        )
++        + "\n![Training reward](training_reward.png)\n\n![Five-impact recovery](five_impact_recovery.png)\n",
++        encoding="utf-8",
++    )
++    return RoundReportPaths(markdown, summary_csv, training_png, recovery_png)
+diff --git a/fast_td3/train.py b/fast_td3/train.py
+index 8aa1b32..51ac1c5 100644
+--- a/fast_td3/train.py
++++ b/fast_td3/train.py
+@@ -1,5 +1,6 @@
+ import os
+ import sys
++import atexit
+
+ os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
+ os.environ["OMP_NUM_THREADS"] = "1"
+@@ -13,6 +14,7 @@ os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"
+ import random
+ import time
+ import math
++from collections import deque
+
+ import tqdm
+ import wandb
+@@ -37,10 +39,15 @@ from fast_td3_utils import (
+     RewardNormalizer,
+     PerTaskRewardNormalizer,
+     SimpleReplayBuffer,
++    extract_replay_metadata,
++    replay_log_metrics,
+     save_params,
+     mark_step,
+ )
+ from hyperparams import get_args
++from local_logging import LocalTrainingLogger, create_run_paths
++from fixed_impact_evaluation import evaluate_fixed_five_impacts
++from round_reporting import write_round_report
+
+ torch.set_float32_matmul_precision("high")
+
+@@ -50,10 +57,25 @@ except ImportError:
+     pass
+
+
++def optional_optimizer_metric(logs_dict, key, *, optimizer_updated, device):
++    """Return a reduced optimizer metric, or NaN when that optimizer did not run."""
++    if optimizer_updated and key in logs_dict:
++        return logs_dict[key].mean()
++    return torch.tensor(float("nan"), device=device)
++
++
+ def main():
+     args = get_args()
+     print(args)
+     run_name = f"{args.env_name}__{args.exp_name}__{args.seed}"
++    run_paths = create_run_paths(args.output_root, args.env_name, args.seed)
++    local_logger = LocalTrainingLogger(
++        run_paths,
++        vars(args),
++        enable_tensorboard=args.use_tensorboard,
++    )
++    atexit.register(local_logger.close)
++    print(f"Run artifacts: {run_paths.run_dir.resolve()}")
+
+     amp_enabled = args.amp and args.cuda and torch.cuda.is_available()
+     amp_device_type = (
+@@ -88,6 +110,9 @@ def main():
+         else:
+             raise ValueError("No GPU available")
+     print(f"Using device: {device}")
++    if device.type == "cuda":
++        torch.cuda.current_device()
++        torch.cuda.reset_peak_memory_stats(device.index)
+
+     if args.env_name.startswith("h1hand-") or args.env_name.startswith("h1-"):
+         from environments.humanoid_bench_env import HumanoidBenchEnv
+@@ -202,7 +227,12 @@ def main():
+         critic_kwargs["task_embedding_dim"] = args.task_embedding_dim
+
+     if args.agent == "fasttd3":
+-        if env_type in ["mtbench"]:
++        if args.env_name == "Isaac-FlightLxx-CTBR-Recovery-Direct-v0":
++            from flightlxx_isaaclab.fast_td3_models import HistoryActor, HistoryCritic
++
++            actor_cls = HistoryActor
++            critic_cls = HistoryCritic
++        elif env_type in ["mtbench"]:
+             from fast_td3 import MultiTaskActor, MultiTaskCritic
+
+             actor_cls = MultiTaskActor
+@@ -319,6 +349,12 @@ def main():
+         n_critic_obs=n_critic_obs,
+         asymmetric_obs=envs.asymmetric_obs,
+         playground_mode=env_type == "mujoco_playground",
++        event_balance_fraction=args.event_balance_fraction,
++        band_balance_fractions=args.band_balance_fractions,
++        failure_context_fraction=args.failure_context_fraction,
++        failure_context_steps=args.failure_context_steps,
++        active_impact_fraction=args.active_impact_fraction,
++        recovery_phase_fraction=args.recovery_phase_fraction,
+         n_steps=args.num_steps,
+         gamma=args.gamma,
+         device=device,
+@@ -326,6 +362,11 @@ def main():
+
+     policy_noise = args.policy_noise
+     noise_clip = args.noise_clip
++    target_noise_scale = torch.tensor(args.target_noise_scale, device=device)
++    if target_noise_scale.numel() == 1:
++        target_noise_scale = target_noise_scale.expand(n_act)
++    elif target_noise_scale.numel() != n_act:
++        raise ValueError(f"target_noise_scale must have 1 or {n_act} values")
+
+     def evaluate():
+         num_eval_envs = eval_envs.num_envs
+@@ -424,10 +465,8 @@ def main():
+             else:
+                 bootstrap = (truncations | ~dones).float()
+
+-            clipped_noise = torch.randn_like(actions)
+-            clipped_noise = clipped_noise.mul(policy_noise).clamp(
+-                -noise_clip, noise_clip
+-            )
++            clipped_noise = torch.randn_like(actions) * target_noise_scale
++            clipped_noise = clipped_noise.mul(policy_noise).clamp(-noise_clip, noise_clip)
+
+             next_state_actions = (actor(next_observations) + clipped_noise).clamp(
+                 action_low, action_high
+@@ -461,6 +500,10 @@ def main():
+                     )
+
+             qf1, qf2 = qnet(critic_observations, actions)
++            qf1_probability = F.softmax(qf1, dim=1)
++            qf2_probability = F.softmax(qf2, dim=1)
++            qf1_value = qnet.get_value(qf1_probability)
++            qf2_value = qnet.get_value(qf2_probability)
+             qf1_loss = -torch.sum(
+                 qf1_next_target_dist * F.log_softmax(qf1, dim=1), dim=1
+             ).mean()
+@@ -487,6 +530,13 @@ def main():
+         logs_dict["qf_loss"] = qf_loss.detach()
+         logs_dict["qf_max"] = qf1_next_target_value.max().detach()
+         logs_dict["qf_min"] = qf1_next_target_value.min().detach()
++        logs_dict["q1_q2_gap"] = (qf1_value - qf2_value).abs().mean().detach()
++        logs_dict["support_boundary_probability"] = (
++            qf1_probability[:, [0, -1]].sum(dim=1).mean()
++            + qf2_probability[:, [0, -1]].sum(dim=1).mean()
++        ).mul(0.5).detach()
++        if "event_type" in data.keys():
++            logs_dict["replay_impact_fraction"] = data["event_type"].float().mean().detach()
+         return logs_dict
+
+     def update_pol(data, logs_dict):
+@@ -566,6 +616,20 @@ def main():
+         )
+         qnet.load_state_dict(torch_checkpoint["qnet_state_dict"])
+         qnet_target.load_state_dict(torch_checkpoint["qnet_target_state_dict"])
++        if torch_checkpoint.get("actor_optimizer_state") is not None:
++            actor_optimizer.load_state_dict(torch_checkpoint["actor_optimizer_state"])
++        if torch_checkpoint.get("q_optimizer_state") is not None:
++            q_optimizer.load_state_dict(torch_checkpoint["q_optimizer_state"])
++        if torch_checkpoint.get("actor_scheduler_state") is not None:
++            actor_scheduler.load_state_dict(torch_checkpoint["actor_scheduler_state"])
++        if torch_checkpoint.get("q_scheduler_state") is not None:
++            q_scheduler.load_state_dict(torch_checkpoint["q_scheduler_state"])
++        if torch_checkpoint.get("reward_normalizer_state") is not None:
++            reward_normalizer.load_state_dict(torch_checkpoint["reward_normalizer_state"])
++        if torch_checkpoint.get("training_state") is not None:
++            envs.load_training_state(torch_checkpoint["training_state"])
++        if torch_checkpoint.get("replay_buffer_state") is not None:
++            rb.load_checkpoint_state(torch_checkpoint["replay_buffer_state"])
+         global_step = torch_checkpoint["global_step"]
+     else:
+         global_step = 0
+@@ -574,10 +638,17 @@ def main():
+     pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
+     start_time = None
+     desc = ""
++    episode_returns = torch.zeros(envs.num_envs, device=device)
++    episode_lengths = torch.zeros(envs.num_envs, dtype=torch.long, device=device)
++    recent_episode_returns = deque(maxlen=100)
++    recent_episode_lengths = deque(maxlen=100)
++    latest_env_logs = {}
+
+     while global_step < args.total_timesteps:
+         mark_step()
+         logs_dict = TensorDict()
++        q_optimizer_updated = False
++        actor_optimizer_updated = False
+         if (
+             start_time is None
+             and global_step >= args.measure_burnin + args.learning_starts
+@@ -593,6 +664,20 @@ def main():
+
+         next_obs, rewards, dones, infos = envs.step(actions.float())
+         truncations = infos["time_outs"]
++        episode_returns += rewards
++        episode_lengths += 1
++        completed = dones.bool()
++        if completed.any():
++            recent_episode_returns.extend(
++                episode_returns[completed].detach().float().cpu().tolist()
++            )
++            recent_episode_lengths.extend(
++                episode_lengths[completed].detach().cpu().tolist()
++            )
++            episode_returns[completed] = 0.0
++            episode_lengths[completed] = 0
++        if "log" in infos:
++            latest_env_logs.update(infos["log"])
+
+         if args.reward_normalization:
+             if env_type == "mtbench":
+@@ -634,13 +719,21 @@ def main():
+         if envs.asymmetric_obs:
+             transition["critic_observations"] = critic_obs
+             transition["next"]["critic_observations"] = true_next_critic_obs
++        transition["event_type"] = infos.get(
++            "event_type", torch.zeros(envs.num_envs, device=device, dtype=torch.uint8)
++        )
++        for name, value in extract_replay_metadata(infos, transition["event_type"]).items():
++            transition[name] = value
+         rb.extend(transition)
+
+         obs = next_obs
+         if envs.asymmetric_obs:
+             critic_obs = next_critic_obs
+
+-        if global_step > args.learning_starts:
++        # Check the current replay occupancy, not the restored global step.
++        # Checkpoints do not contain replay data, so resumed runs must collect a
++        # fresh warm-up before sampling.
++        if rb.ptr > args.learning_starts:
+             for i in range(args.num_updates):
+                 data = rb.sample(max(1, args.batch_size // args.num_envs))
+                 data["observations"] = normalize_obs(data["observations"])
+@@ -666,36 +759,85 @@ def main():
+                     data["next"]["rewards"] = normalize_reward(raw_rewards)
+
+                 logs_dict = update_main(data, logs_dict)
++                q_optimizer_updated = True
+                 if args.num_updates > 1:
+                     if i % args.policy_frequency == 1:
+                         logs_dict = update_pol(data, logs_dict)
++                        actor_optimizer_updated = True
+                 else:
+                     if global_step % args.policy_frequency == 0:
+                         logs_dict = update_pol(data, logs_dict)
++                        actor_optimizer_updated = True
+
+                 soft_update(qnet, qnet_target, args.tau)
+
+-            if global_step % 100 == 0 and start_time is not None:
++            if global_step % args.log_interval == 0 and start_time is not None:
+                 speed = (global_step - measure_burnin) / (time.time() - start_time)
+                 pbar.set_description(f"{speed: 4.4f} sps, " + desc)
+                 with torch.no_grad():
+                     logs = {
+-                        "actor_loss": logs_dict["actor_loss"].mean(),
++                        "actor_loss": optional_optimizer_metric(
++                            logs_dict,
++                            "actor_loss",
++                            optimizer_updated=actor_optimizer_updated,
++                            device=device,
++                        ),
+                         "qf_loss": logs_dict["qf_loss"].mean(),
+                         "qf_max": logs_dict["qf_max"].mean(),
+                         "qf_min": logs_dict["qf_min"].mean(),
+-                        "actor_grad_norm": logs_dict["actor_grad_norm"].mean(),
++                        "actor_grad_norm": optional_optimizer_metric(
++                            logs_dict,
++                            "actor_grad_norm",
++                            optimizer_updated=actor_optimizer_updated,
++                            device=device,
++                        ),
+                         "critic_grad_norm": logs_dict["critic_grad_norm"].mean(),
+                         "env_rewards": rewards.mean(),
+                         "buffer_rewards": raw_rewards.mean(),
++                        "q1_q2_gap": logs_dict["q1_q2_gap"].mean(),
++                        "support_boundary_probability": logs_dict["support_boundary_probability"].mean(),
++                        "replay_impact_fraction": logs_dict.get("replay_impact_fraction", torch.tensor(0.0, device=device)),
++                        "train/vector_sps": speed,
++                        "train/sample_sps": speed * args.num_envs,
++                        "frame": global_step * args.num_envs,
++                        "critic_lr": q_scheduler.get_last_lr()[0],
++                        "actor_lr": actor_scheduler.get_last_lr()[0],
+                     }
++                    if device.type == "cuda":
++                        logs["system/gpu_memory_allocated_gb"] = (
++                            torch.cuda.memory_allocated(device) / 1024**3
++                        )
++                        logs["system/gpu_memory_reserved_gb"] = (
++                            torch.cuda.memory_reserved(device) / 1024**3
++                        )
++                        logs["system/gpu_memory_peak_allocated_gib"] = (
++                            torch.cuda.max_memory_allocated(device) / 1024**3
++                        )
++                        logs["system/gpu_memory_peak_reserved_gib"] = (
++                            torch.cuda.max_memory_reserved(device) / 1024**3
++                        )
++                    if recent_episode_returns:
++                        logs["episode_return_mean"] = float(
++                            np.mean(recent_episode_returns)
++                        )
++                        logs["episode_length_mean"] = float(
++                            np.mean(recent_episode_lengths)
++                        )
++                    logs.update(latest_env_logs)
++                    logs.update(replay_log_metrics(rb))
+
+                     if args.eval_interval > 0 and global_step % args.eval_interval == 0:
+                         print(f"Evaluating at global step {global_step}")
+                         eval_avg_return, eval_avg_length = evaluate()
+                         if env_type in ["humanoid_bench", "isaaclab", "mtbench"]:
+                             # NOTE: Hacky way of evaluating performance, but just works
+-                            obs = envs.reset()
++                            if envs.asymmetric_obs:
++                                obs, critic_obs = envs.reset_with_critic_obs()
++                            else:
++                                obs = envs.reset()
++                            episode_returns.zero_()
++                            episode_lengths.zero_()
++                            dones = None
+                         logs["eval_avg_return"] = eval_avg_return
+                         logs["eval_avg_length"] = eval_avg_length
+
+@@ -712,15 +854,10 @@ def main():
+                             format="gif",
+                         )
+                         logs["render_video"] = render_video
++                local_logger.log(global_step, logs)
+                 if args.use_wandb:
+                     wandb.log(
+-                        {
+-                            "speed": speed,
+-                            "frame": global_step * args.num_envs,
+-                            "critic_lr": q_scheduler.get_last_lr()[0],
+-                            "actor_lr": actor_scheduler.get_last_lr()[0],
+-                            **logs,
+-                        },
++                        logs,
+                         step=global_step,
+                     )
+
+@@ -738,12 +875,35 @@ def main():
+                     obs_normalizer,
+                     critic_obs_normalizer,
+                     args,
+-                    f"models/{run_name}_{global_step}.pt",
++                    str(run_paths.checkpoints_dir / f"step_{global_step:08d}.pt"),
++                    actor_optimizer=actor_optimizer,
++                    q_optimizer=q_optimizer,
++                    actor_scheduler=actor_scheduler,
++                    q_scheduler=q_scheduler,
++                    reward_normalizer=reward_normalizer,
++                    training_state=envs.get_training_state(),
++                    replay_buffer=rb if args.checkpoint_replay else None,
+                 )
++                if env_type == "isaaclab" and args.env_name.startswith("Isaac-FlightLxx-"):
++                    fixed_result = evaluate_fixed_five_impacts(
++                        envs, actor, normalize_obs, global_step, run_paths.run_dir
++                    )
++                    local_logger.log(
++                        global_step,
++                        {f"evaluation/{key}": value for key, value in fixed_result.items() if isinstance(value, (int, float, bool))},
++                    )
++                    # Evaluation has reset the simulator in a guarded mode;
++                    # start the next training transition from fresh normal data.
++                    obs, critic_obs = envs.reset_with_critic_obs()
++                    episode_returns.zero_()
++                    episode_lengths.zero_()
++                    dones = None
+
+         global_step += 1
+-        actor_scheduler.step()
+-        q_scheduler.step()
++        if q_optimizer_updated:
++            q_scheduler.step()
++        if actor_optimizer_updated:
++            actor_scheduler.step()
+         pbar.update(1)
+
+     save_params(
+@@ -754,8 +914,23 @@ def main():
+         obs_normalizer,
+         critic_obs_normalizer,
+         args,
+-        f"models/{run_name}_final.pt",
++        str(run_paths.checkpoints_dir / f"final_step_{global_step:08d}.pt"),
++        actor_optimizer=actor_optimizer,
++        q_optimizer=q_optimizer,
++        actor_scheduler=actor_scheduler,
++        q_scheduler=q_scheduler,
++        reward_normalizer=reward_normalizer,
++        training_state=envs.get_training_state(),
++        replay_buffer=rb if args.checkpoint_replay else None,
+     )
++    if env_type == "isaaclab" and args.env_name.startswith("Isaac-FlightLxx-"):
++        fixed_result = evaluate_fixed_five_impacts(envs, actor, normalize_obs, global_step, run_paths.run_dir)
++        local_logger.log(
++            global_step,
++            {f"evaluation/{key}": value for key, value in fixed_result.items() if isinstance(value, (int, float, bool))},
++        )
++    write_round_report(run_paths.run_dir)
++    local_logger.close()
+
+
+ if __name__ == "__main__":

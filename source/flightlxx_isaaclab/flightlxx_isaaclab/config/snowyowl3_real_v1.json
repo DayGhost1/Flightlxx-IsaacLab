@@ -1,0 +1,72 @@
+{
+  "platform_id": "snowyowl3_real_v1",
+  "battery_cells": 4,
+  "target": {
+    "position_vicon_m": [-0.2, -0.75, 1.5],
+    "rpy_deg": [0.0, 0.0, 0.0],
+    "placeholder": false,
+    "source": "Measured at the SnowyOwl3 Vicon flight site on 2026-08-31; unified simulation and real-flight hover target XYZ [-0.2, -0.75, 1.5] m"
+  },
+  "propeller": {
+    "dataset": "电机正转数据.xlsx",
+    "thrust_coefficient_n_per_rpm2": 1.78036e-08
+  },
+  "motor": {
+    "model": "T-Motor F60PRO IV V2.0 KV2550",
+    "rpm_official_max": 26363.0,
+    "rpm_official_max_source": "T-Motor official F60PRO IV V2.0 KV2550 performance table: T5150 tri-blade, F45A ESC, 100% throttle, 14.46 V, 41.65 A, 26363 RPM, 1336 g thrust",
+    "policy_rpm_fraction": 0.8
+  },
+  "vicon": {
+    "sample_hz": 100.0,
+    "output_hz": 50.0,
+    "angular_window_s": 0.06,
+    "measurement_age_s": 0.01,
+    "sampling_jitter_s": 0.002,
+    "source": "2026-08-29 rosbag timing: nominal 100 Hz Vicon pose stream; state-to-policy phase median about 9 ms across the two flights; 60 ms quaternion derivative window from the deployed bridge contract"
+  },
+  "betaflight": {
+    "firmware_version": "Betaflight 4.3.0 (3267f0417), target STM32F7X2 / TMOTORF7",
+    "pid_loop_hz": 3184,
+    "pid_loop_source": "SnowyOwl3.0 CLI status, 2026-08-29: cycle time=314 us, GYRO rate=3184 Hz, pid_process_denom=1",
+    "rate_profile_source": "SnowyOwl3.0 CLI diff all, 2026-08-30: active rateprofile 0; RC rates roll/pitch/yaw=72/72/36 and super-rates=72/72/36",
+    "rate_profile": {
+      "rc_rate": [72, 72, 36],
+      "super_rate": [72, 72, 36]
+    },
+    "filter_profile_source": "SnowyOwl3.0 CLI diff all, 2026-08-30, interpreted with Betaflight 4.3.0 target defaults; dyn_notch_count=1 and dyn_notch_q=500",
+    "active_pid_profile": 1,
+    "active_rate_profile": 0,
+    "motor_protocol": "DSHOT600",
+    "dshot_bidirectional": true,
+    "dshot_idle_value": 500,
+    "vbat_sag_compensation": 0,
+    "auto_profile_cell_count": 4,
+    "d_max_gain": 37,
+    "d_max_advance": 20,
+    "dterm_lpf1_hz": 75,
+    "dterm_lpf2_hz": 150,
+    "iterm_relax_cutoff_hz": 15,
+    "tpa_rate_percent": 65,
+    "tpa_breakpoint_us": 1350,
+    "feedforward_smooth_factor": 25,
+    "feedforward_jitter_factor": 7,
+    "feedforward_boost": 15,
+    "feedforward_max_rate_limit": 90,
+    "rc_smoothing_enabled": true,
+    "rc_smoothing_auto_factor_rpy": 30,
+    "rc_smoothing_feedforward_cutoff_hz": 0,
+    "rc_smoothing_setpoint_cutoff_hz": 0,
+    "control_link_hz": 50.0,
+    "actor_rate_max_dps": [360.0, 360.0, 180.0],
+    "bridge_rate_max_dps": [720.0, 720.0, 360.0],
+    "bridge_yaw_reversed": true,
+    "control_link_source": "FastTD3 real node loop_hz=50 and SBus bridge BODY_RATES mapping: actor limits 360/360/180 deg/s to bridge limits 720/720/360 deg/s, yaw negated; one received command immediately emits one SBus frame",
+    "rc_smoothing_source": "Blackbox headers, 2026-08-29: rc_smoothing=1, auto factor RPY=30, feedforward/setpoint cutoffs=0 (auto)",
+    "pid_profile": {
+      "roll": {"p": 45, "i": 80, "d": 40, "d_min": 30, "f": 120},
+      "pitch": {"p": 47, "i": 84, "d": 46, "d_min": 34, "f": 125},
+      "yaw": {"p": 45, "i": 80, "d": 0, "d_min": 0, "f": 120}
+    }
+  }
+}

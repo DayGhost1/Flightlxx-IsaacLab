@@ -1,0 +1,53 @@
+# Python caches and generated package metadata
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Training, evaluation, and monitoring artifacts
+/outputs/
+/test_outputs/
+/goal_rounds/
+/backups/
+/logs/
+/checkpoints/
+/runs/
+/wandb/
+/videos/
+/build/
+/render/
+
+# Local datasets and recorded flight data
+/data/
+/datasets/
+/recordings/
+/rosbags/
+*.bag
+*.db3
+*.bbl
+*.BBL
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npy
+*.npz
+
+# Legacy experiment artifacts bundled with the original project
+/rl/BidirectionalThrustControl/training_data_*/
+/rl/BidirectionalThrustControl/Documents/
+/rl/BidirectionalThrustControl/neural_network_*.zip
+/rl/BidirectionalThrustControl/trajectory_*.csv
+
+# Local-only regression tests and implementation notes
+/tests/
+**/test_*.py
+**/*_test.py
+*.before_*
+*.orig
+/TEST_RESULTS.md
+/docs/superpowers/
+/scripts/*smoke*
+/scripts/*verify*
+/scripts/validate_*
+/scripts/launch_repaired_training_when_idle.sh

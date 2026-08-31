@@ -1,0 +1,18 @@
+# FastTD3 runtime dependencies compatible with Isaac Lab v2.1.1's existing
+# PyTorch 2.7.0+cu128 installation.  Deliberately excludes torch/vision/audio.
+gymnasium==0.29.0
+jax-jumpy==1.0.0
+matplotlib
+moviepy
+numpy<2.0
+pandas
+protobuf
+pygame
+stable-baselines3
+tqdm
+wandb
+torchrl==0.7.2
+tensordict==0.7.2
+tyro
+loguru
+

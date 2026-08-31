@@ -1,0 +1,18 @@
+{
+  "protocol_id": "fixed_five_impacts_v1",
+  "total_duration_s": 23.0,
+  "recovery_dwell_s": 0.5,
+  "thresholds": {
+    "position_error": 0.15,
+    "linear_speed": 0.25,
+    "attitude_error_rad": 0.2,
+    "angular_speed": 0.35
+  },
+  "impacts": [
+    {"impact_id": "lateral_center", "trigger_time_s": 3.0, "duration_s": 0.12, "application_point_b": [0.0, 0.0, 0.0], "force_b": [5.0, 0.0, 0.0]},
+    {"impact_id": "yaw_offset", "trigger_time_s": 7.0, "duration_s": 0.10, "application_point_b": [0.025, 0.0, 0.0], "force_b": [0.0, -6.0, 0.0]},
+    {"impact_id": "diagonal_offset", "trigger_time_s": 11.0, "duration_s": 0.14, "application_point_b": [0.0, 0.03, 0.015], "force_b": [-4.0, 4.0, 0.0]},
+    {"impact_id": "downward_roll", "trigger_time_s": 15.0, "duration_s": 0.10, "application_point_b": [0.0, -0.025, 0.0], "force_b": [2.0, 0.0, -5.0]},
+    {"impact_id": "oblique_final", "trigger_time_s": 19.0, "duration_s": 0.12, "application_point_b": [0.02, 0.02, -0.015], "force_b": [-7.0, -3.0, 1.0]}
+  ]
+}

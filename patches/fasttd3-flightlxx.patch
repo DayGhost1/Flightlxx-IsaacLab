@@ -1,0 +1,46 @@
+diff --git a/fast_td3/environments/isaaclab_env.py b/fast_td3/environments/isaaclab_env.py
+index 2374ebc..eaabc66 100644
+--- a/fast_td3/environments/isaaclab_env.py
++++ b/fast_td3/environments/isaaclab_env.py
+@@ -21,6 +21,14 @@ class IsaacLabEnv:
+         simulation_app = app_launcher.app
+ 
+         import isaaclab_tasks
++        # Register the external FlightLxx task when its package is installed.
++        try:
++            import flightlxx_isaaclab.tasks  # noqa: F401
++        except ModuleNotFoundError as exc:
++            if task_name.startswith("Isaac-FlightLxx-"):
++                raise ModuleNotFoundError(
++                    "FlightLxx task requested but flightlxx_isaaclab is not installed"
++                ) from exc
+         from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+ 
+         env_cfg = parse_env_cfg(
+diff --git a/fast_td3/train.py b/fast_td3/train.py
+index 8aa1b32..88f85ad 100644
+--- a/fast_td3/train.py
++++ b/fast_td3/train.py
+@@ -202,7 +202,12 @@ def main():
+         critic_kwargs["task_embedding_dim"] = args.task_embedding_dim
+ 
+     if args.agent == "fasttd3":
+-        if env_type in ["mtbench"]:
++        if args.env_name == "Isaac-FlightLxx-CTBR-Recovery-Direct-v0":
++            from flightlxx_isaaclab.fast_td3_models import HistoryActor, HistoryCritic
++
++            actor_cls = HistoryActor
++            critic_cls = HistoryCritic
++        elif env_type in ["mtbench"]:
+             from fast_td3 import MultiTaskActor, MultiTaskCritic
+ 
+             actor_cls = MultiTaskActor
+@@ -643,4 +648,7 @@ def main():
+-        if global_step > args.learning_starts:
++        # Check the current replay occupancy, not the restored global step.
++        # Checkpoints do not contain replay data, so resumed runs must collect a
++        # fresh warm-up before sampling.
++        if rb.ptr > args.learning_starts:
+             for i in range(args.num_updates):
+                 data = rb.sample(max(1, args.batch_size // args.num_envs))
+                 data["observations"] = normalize_obs(data["observations"])

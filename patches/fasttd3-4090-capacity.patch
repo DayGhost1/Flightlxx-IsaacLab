@@ -1,0 +1,12 @@
+diff --git a/fast_td3/hyperparams.py b/fast_td3/hyperparams.py
+--- a/fast_td3/hyperparams.py
++++ b/fast_td3/hyperparams.py
+@@ -471,6 +471,6 @@ class FlightLxxCTBRArgs(IsaacLabArgs):
+     env_name: str = "Isaac-FlightLxx-CTBR-Recovery-Direct-v0"
+     num_envs: int = 1024
+     num_eval_envs: int = 1024
+-    buffer_size: int = 2048
+-    batch_size: int = 16384
++    buffer_size: int = 3072
++    batch_size: int = 24576
+     num_atoms: int = 251

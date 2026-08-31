@@ -1,0 +1,21 @@
+diff --git a/fast_td3/train.py b/fast_td3/train.py
+--- a/fast_td3/train.py
++++ b/fast_td3/train.py
+@@ -103,3 +103,6 @@ def main():
+     print(f"Using device: {device}")
++    if device.type == "cuda":
++        torch.cuda.current_device()
++        torch.cuda.reset_peak_memory_stats(device.index)
+
+     if args.env_name.startswith("h1hand-") or args.env_name.startswith("h1-"):
+@@ -781,4 +783,10 @@ def main():
+                         logs["system/gpu_memory_reserved_gb"] = (
+                             torch.cuda.memory_reserved(device) / 1024**3
+                         )
++                        logs["system/gpu_memory_peak_allocated_gib"] = (
++                            torch.cuda.max_memory_allocated(device) / 1024**3
++                        )
++                        logs["system/gpu_memory_peak_reserved_gib"] = (
++                            torch.cuda.max_memory_reserved(device) / 1024**3
++                        )
+                     if recent_episode_returns:
