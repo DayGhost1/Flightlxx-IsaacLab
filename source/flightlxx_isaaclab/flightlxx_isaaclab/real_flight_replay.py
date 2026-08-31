@@ -126,3 +126,9 @@ def verify_checkpoint(path: str | Path, expected_sha256: str | None = None) -> s
             f"Checkpoint SHA-256 mismatch: expected {expected_sha256}, got {digest}"
         )
     return digest
+
+
+def reset_replay_control_state(raw_env, env_ids: torch.Tensor) -> None:
+    """Reset the control states used by the current Betaflight execution path."""
+    raw_env._betaflight.reset(env_ids)
+    raw_env._actuator.reset(env_ids)

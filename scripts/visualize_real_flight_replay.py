@@ -44,6 +44,7 @@ from flightlxx_isaaclab.real_flight_replay import (  # noqa: E402
     REAL_FLIGHT_BASELINE,
     ReplayMetrics,
     replay_scenarios,
+    reset_replay_control_state,
     verify_checkpoint,
 )
 from flightlxx_isaaclab.visual_playback import configure_visual_scene, transform_body_points  # noqa: E402
@@ -218,7 +219,7 @@ def set_initial_state(raw_env, scenario):
     raw_env._robot.write_root_velocity_to_sim(velocity, env_ids)
     raw_env._actions[env_ids] = 0.0
     raw_env._previous_actions[env_ids] = 0.0
-    raw_env._controller.reset(env_ids)
+    reset_replay_control_state(raw_env, env_ids)
     initial_feature = torch.cat((raw_env._current_state(noisy=False)[env_ids], raw_env._actions[env_ids]), dim=-1)
     raw_env._history.reset(env_ids, initial_feature)
     return raw_env._get_observations()["policy"]

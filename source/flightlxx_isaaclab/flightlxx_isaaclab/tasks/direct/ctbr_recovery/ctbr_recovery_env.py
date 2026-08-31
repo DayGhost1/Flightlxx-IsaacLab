@@ -191,7 +191,7 @@ class CTBRRecoveryEnv(DirectRLEnv):
             self.num_envs,
             self.device,
             MotorActuatorCfg(
-                dt=self.step_dt,
+                dt=cfg.sim.dt,
                 mass=cfg.mass,
                 thrust_coefficient_n_per_rpm2=self._platform.propeller_thrust_coefficient,
                 motor_kv_rpm_per_v=2550.0,
@@ -226,6 +226,10 @@ class CTBRRecoveryEnv(DirectRLEnv):
         )
         self._thrust = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._control_torque = torch.zeros_like(self._thrust)
+        self._rc_deflection = torch.zeros(self.num_envs, 3, device=self.device)
+        self._rate_setpoint_dps = torch.zeros_like(self._rc_deflection)
+        self._throttle = torch.zeros(self.num_envs, device=self.device)
+        self._new_rc_frame_pending = False
         self._disturbance_force = torch.zeros_like(self._thrust)
         self._disturbance_torque = torch.zeros_like(self._thrust)
         self._scheduled_force = torch.zeros_like(self._thrust)
@@ -413,27 +417,37 @@ class CTBRRecoveryEnv(DirectRLEnv):
         self._previous_actions.copy_(self._actions)
         self._actions.copy_(actions.clamp(-1.0, 1.0))
         self._executed_actions.copy_(self._action_delay.step(self._actions))
-        rc_deflection = self._betaflight.profile.ctbr_action_to_rc_deflection(
-            self._executed_actions[:, 1:]
+        self._rc_deflection.copy_(
+            self._betaflight.profile.ctbr_action_to_rc_deflection(
+                self._executed_actions[:, 1:]
+            )
         )
-        rate_setpoint_dps = self._betaflight.profile.ctbr_action_to_rate_setpoint_dps(
-            self._executed_actions[:, 1:]
+        self._rate_setpoint_dps.copy_(
+            self._betaflight.profile.ctbr_action_to_rate_setpoint_dps(
+                self._executed_actions[:, 1:]
+            )
         )
-        gyro_rate_dps = self._robot.data.root_ang_vel_b * (180.0 / math.pi)
-        pid = self._betaflight.advance_sample_hold(
-            rate_setpoint_dps,
-            gyro_rate_dps,
-            hold_s=self.step_dt,
-            throttle=(self._executed_actions[:, 0] + 1.0) * 0.5,
-            rc_deflection=rc_deflection,
-        )
-        thrust, torque = self._actuator.step_betaflight(self._executed_actions, pid.pid_sum)
-        self._thrust.zero_()
-        self._thrust[:, 0, 2] = thrust[:, 0]
-        self._control_torque[:, 0] = torque
+        self._throttle.copy_((self._executed_actions[:, 0] + 1.0) * 0.5)
+        self._new_rc_frame_pending = True
         self._update_disturbances()
 
     def _apply_action(self):
+        gyro_rate_dps = self._robot.data.root_ang_vel_b * (180.0 / math.pi)
+        pid = self._betaflight.advance_physics_tick(
+            self._rate_setpoint_dps,
+            gyro_rate_dps,
+            physics_dt_s=self.cfg.sim.dt,
+            throttle=self._throttle,
+            rc_deflection=self._rc_deflection,
+            new_rc_frame=self._new_rc_frame_pending,
+        )
+        self._new_rc_frame_pending = False
+        thrust, torque = self._actuator.step_betaflight(
+            self._executed_actions, pid.pid_sum
+        )
+        self._thrust.zero_()
+        self._thrust[:, 0, 2] = thrust[:, 0]
+        self._control_torque[:, 0] = torque
         self._vicon_time_s += self.cfg.sim.dt
         if self._vicon_sample_clock.consume_if_due(self._vicon_time_s):
             self._vicon.push(
@@ -517,7 +531,7 @@ class CTBRRecoveryEnv(DirectRLEnv):
         self.extras["disturbance_difficulty"] = torch.full_like(
             self._episode_difficulty, self._stage_curriculum.disturbance_difficulty
         )
-        actuator_diagnostics = self._actuator.diagnostics()
+        actuator_diagnostics = self._actuator.diagnostics(copy=False)
         self.extras["motor_saturation_fraction"] = (
             actuator_diagnostics["motor_rpm"]
             >= 0.99 * actuator_diagnostics["hardware_rpm_limit"][:, None]
@@ -581,7 +595,7 @@ class CTBRRecoveryEnv(DirectRLEnv):
             self._precision_recovery_criteria,
         )
         failure = self._failure_mask()
-        actuator_diagnostics = self._actuator.diagnostics()
+        actuator_diagnostics = self._actuator.diagnostics(copy=False)
         motor_saturation_fraction = (
             actuator_diagnostics["motor_rpm"]
             >= 0.99 * actuator_diagnostics["hardware_rpm_limit"][:, None]
@@ -629,7 +643,7 @@ class CTBRRecoveryEnv(DirectRLEnv):
             )
             attitude_error_quat = quat_error(self._target_quat, self._robot.data.root_quat_w)
             controller = self._betaflight.diagnostics()
-            actuator = self._actuator.diagnostics()
+            actuator = self._actuator.diagnostics(copy=False)
             diagnostic_vectors = {
                 "position_error_b": position_error_b,
                 "linear_velocity_b": self._robot.data.root_lin_vel_b,

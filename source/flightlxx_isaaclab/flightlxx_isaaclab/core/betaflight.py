@@ -143,6 +143,15 @@ class BetaflightRateLoop:
         self.dterm_lpf1_hz = profile.dterm_lpf1_hz
         self.dterm_lpf2_hz = profile.dterm_lpf2_hz
         self.iterm_relax_cutoff_hz = profile.iterm_relax_cutoff_hz
+        self._iterm_relax_gain = self.dt_s / (
+            self.dt_s + 1.0 / (2.0 * math.pi * self.iterm_relax_cutoff_hz)
+        )
+        self._dterm_lpf1_gain = self.dt_s / (
+            self.dt_s + 1.0 / (2.0 * math.pi * self.dterm_lpf1_hz)
+        )
+        self._dterm_lpf2_gain = self.dt_s / (
+            self.dt_s + 1.0 / (2.0 * math.pi * self.dterm_lpf2_hz)
+        )
         self.tpa_rate = profile.tpa_rate_percent / 100.0
         self.tpa_breakpoint = (profile.tpa_breakpoint_us - 1000) / 1000.0
         axes = (profile.roll, profile.pitch, profile.yaw)
@@ -201,6 +210,10 @@ class BetaflightRateLoop:
         self._last_rate_error_dps = torch.zeros(num_envs, 3, device=self.device)
         self._last_pid_sum = torch.zeros(num_envs, 3, device=self.device)
         self._last_inner_ticks = 0
+        self._cascade_transition_cache: dict[
+            tuple[tuple[float, ...], int, torch.dtype],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
 
     def _auto_rc_smoothing_cutoff_hz(self) -> float:
         return float(round(self.profile.control_link_hz * 1.5 / (1.0 + self.profile.rc_smoothing_auto_factor_rpy / 10.0)))
@@ -293,6 +306,85 @@ class BetaflightRateLoop:
         state2 += gain * (state1 - state2)
         state += gain * (state2 - state)
         return state
+
+    def _consume_tick_budget(self, interval_s: float) -> int:
+        """Convert a slower simulation interval into firmware PID ticks."""
+        if interval_s <= 0.0:
+            raise ValueError("interval_s must be positive")
+        tick_budget = interval_s / self.dt_s + self._tick_fraction
+        inner_ticks = int(tick_budget)
+        self._tick_fraction = tick_budget - inner_ticks
+        if inner_ticks <= 0:
+            raise RuntimeError("simulation interval is shorter than one PID tick")
+        return inner_ticks
+
+    def _cascade_transition(
+        self,
+        gains: tuple[float, ...],
+        inner_ticks: int,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return exact constant-input state and mean transitions for a PT cascade.
+
+        The matrices are built once for the six/seven firmware ticks contained
+        in a 2 ms PhysX step.  Applying them replaces a Python loop and dozens
+        of small CUDA kernels without changing the firmware filter timebase.
+        """
+        key = (gains, inner_ticks, dtype)
+        cached = self._cascade_transition_cache.get(key)
+        if cached is not None:
+            return cached
+
+        order = len(gains)
+        one_step = torch.eye(order, device=self.device, dtype=dtype)
+        one_input = torch.zeros(order, device=self.device, dtype=dtype)
+        for stage, gain_value in enumerate(gains):
+            gain = torch.as_tensor(gain_value, device=self.device, dtype=dtype)
+            previous_row = (
+                one_step[stage - 1].clone()
+                if stage > 0
+                else torch.zeros(order, device=self.device, dtype=dtype)
+            )
+            previous_input = one_input[stage - 1].clone() if stage > 0 else gain.new_tensor(1.0)
+            one_step[stage] = (1.0 - gain) * one_step[stage] + gain * previous_row
+            one_input[stage] = (1.0 - gain) * one_input[stage] + gain * previous_input
+
+        transition = torch.eye(order, device=self.device, dtype=dtype)
+        input_transition = torch.zeros(order, device=self.device, dtype=dtype)
+        mean_transition = torch.zeros_like(transition)
+        mean_input_transition = torch.zeros_like(input_transition)
+        for _ in range(inner_ticks):
+            input_transition = one_step @ input_transition + one_input
+            transition = one_step @ transition
+            mean_transition += transition
+            mean_input_transition += input_transition
+        mean_transition /= inner_ticks
+        mean_input_transition /= inner_ticks
+        cached = (transition, input_transition, mean_transition, mean_input_transition)
+        self._cascade_transition_cache[key] = cached
+        return cached
+
+    def _advance_cascade_constant(
+        self,
+        input_value: torch.Tensor,
+        states: tuple[torch.Tensor, ...],
+        gains: tuple[float, ...],
+        inner_ticks: int,
+        *,
+        return_average: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        transition, input_transition, mean_transition, mean_input_transition = (
+            self._cascade_transition(gains, inner_ticks, input_value.dtype)
+        )
+        stacked = torch.stack(states, dim=-1)
+        final = stacked @ transition.T + input_value[..., None] * input_transition
+        average = None
+        if return_average:
+            average_states = stacked @ mean_transition.T + input_value[..., None] * mean_input_transition
+            average = average_states[..., -1]
+        for stage, state in enumerate(states):
+            state.copy_(final[..., stage])
+        return states[-1], average
 
     def _update_feedforward(self, raw_setpoint_dps: torch.Tensor, rc_deflection: torch.Tensor) -> None:
         rx_rate = self.profile.control_link_hz
@@ -397,16 +489,19 @@ class BetaflightRateLoop:
             (throttle_tensor - self.tpa_breakpoint) / (1.0 - self.tpa_breakpoint)
         ).clamp(0.0, 1.0)
         p_term = self._kp * error * tpa_factor[:, None]
-        relax_alpha = self.dt_s / (self.dt_s + 1.0 / (2.0 * torch.pi * self.iterm_relax_cutoff_hz))
-        self._setpoint_lpf += relax_alpha * (current_setpoint_dps - self._setpoint_lpf)
+        self._setpoint_lpf += self._iterm_relax_gain * (
+            current_setpoint_dps - self._setpoint_lpf
+        )
         iterm_error = error.clone()
         iterm_relax_factor = (1.0 - (current_setpoint_dps - self._setpoint_lpf).abs() / 40.0).clamp_min(0.0)
         iterm_error[:, :2] *= iterm_relax_factor[:, :2]
         self._iterm = (self._iterm + self._ki * self.dt_s * iterm_error).clamp(-400.0, 400.0)
-        lpf1_alpha = self.dt_s / (self.dt_s + 1.0 / (2.0 * torch.pi * self.dterm_lpf1_hz))
-        lpf2_alpha = self.dt_s / (self.dt_s + 1.0 / (2.0 * torch.pi * self.dterm_lpf2_hz))
-        self._dterm_lpf1 += lpf1_alpha * (gyro_rate_dps - self._dterm_lpf1)
-        self._dterm_lpf2 += lpf2_alpha * (self._dterm_lpf1 - self._dterm_lpf2)
+        self._dterm_lpf1 += self._dterm_lpf1_gain * (
+            gyro_rate_dps - self._dterm_lpf1
+        )
+        self._dterm_lpf2 += self._dterm_lpf2_gain * (
+            self._dterm_lpf1 - self._dterm_lpf2
+        )
         derivative = -(self._dterm_lpf2 - self._previous_gyro_dps) / self.dt_s
         setpoint_delta = current_setpoint_dps - self._previous_setpoint_dps
         self._dmin_range_state1 += self._dmin_range_gain * (derivative - self._dmin_range_state1)
@@ -450,13 +545,7 @@ class BetaflightRateLoop:
         throttle: torch.Tensor | float = 0.0,
         rc_deflection: torch.Tensor | None = None,
     ) -> RateLoopAdvance:
-        if hold_s <= 0.0:
-            raise ValueError("hold_s must be positive")
-        tick_budget = hold_s / self.dt_s + self._tick_fraction
-        inner_ticks = int(tick_budget)
-        self._tick_fraction = tick_budget - inner_ticks
-        if inner_ticks <= 0:
-            raise RuntimeError("policy hold interval is shorter than one PID tick")
+        inner_ticks = self._consume_tick_budget(hold_s)
         pid_sum = torch.zeros(self.num_envs, 3, device=self.device)
         for tick in range(inner_ticks):
             pid_sum += self.step(
@@ -470,6 +559,151 @@ class BetaflightRateLoop:
         self._last_pid_sum.copy_(average_pid_sum)
         self._last_inner_ticks = inner_ticks
         return RateLoopAdvance(pid_sum=average_pid_sum, inner_ticks=inner_ticks)
+
+    def advance_physics_tick(
+        self,
+        rate_setpoint_dps: torch.Tensor,
+        gyro_rate_dps: torch.Tensor,
+        *,
+        physics_dt_s: float,
+        throttle: torch.Tensor | float = 0.0,
+        rc_deflection: torch.Tensor | None = None,
+        new_rc_frame: bool = False,
+    ) -> RateLoopAdvance:
+        """Advance a 3184 Hz Betaflight loop over one slower physics tick.
+
+        Gyro and motor feedback are refreshed at the PhysX rate.  Firmware
+        filter cascades are collapsed into exact six/seven-tick state
+        transitions for a held input, so the simulation retains the measured
+        filter time constants without executing 3184 Python-level PID calls.
+        The returned PID sum is the interval-average command applied to the
+        motor model during this physics step.
+        """
+        expected = (self.num_envs, 3)
+        if rate_setpoint_dps.shape != expected or gyro_rate_dps.shape != expected:
+            raise ValueError("rate_setpoint_dps and gyro_rate_dps must be [num_envs, 3]")
+        if rc_deflection is None:
+            rc_deflection = self._infer_rc_deflection(rate_setpoint_dps)
+        if rc_deflection.shape != expected:
+            raise ValueError("rc_deflection must be [num_envs, 3]")
+
+        inner_ticks = self._consume_tick_budget(physics_dt_s)
+        interval_s = inner_ticks * self.dt_s
+        if new_rc_frame:
+            self._update_feedforward(rate_setpoint_dps, rc_deflection)
+
+        current_setpoint_dps, average_setpoint_dps = self._advance_cascade_constant(
+            rate_setpoint_dps,
+            (self._rc_setpoint_state1, self._rc_setpoint_state2, self._rc_setpoint_state),
+            (
+                self._rc_smoothing_setpoint_gain,
+                self._rc_smoothing_setpoint_gain,
+                self._rc_smoothing_setpoint_gain,
+            ),
+            inner_ticks,
+            return_average=True,
+        )
+        assert average_setpoint_dps is not None
+        average_error = average_setpoint_dps - gyro_rate_dps
+
+        throttle_tensor = torch.as_tensor(
+            throttle, device=self.device, dtype=rate_setpoint_dps.dtype
+        ).reshape(-1)
+        if throttle_tensor.numel() == 1:
+            throttle_tensor = throttle_tensor.expand(self.num_envs)
+        if throttle_tensor.shape != (self.num_envs,):
+            raise ValueError("throttle must be scalar or [num_envs]")
+        tpa_factor = 1.0 - self.tpa_rate * (
+            (throttle_tensor - self.tpa_breakpoint) / (1.0 - self.tpa_breakpoint)
+        ).clamp(0.0, 1.0)
+        p_term = self._kp * average_error * tpa_factor[:, None]
+
+        relax_alpha_effective = 1.0 - (
+            1.0 - self._iterm_relax_gain
+        ) ** inner_ticks
+        self._setpoint_lpf += relax_alpha_effective * (
+            average_setpoint_dps - self._setpoint_lpf
+        )
+        iterm_error = average_error.clone()
+        iterm_relax_factor = (
+            1.0 - (average_setpoint_dps - self._setpoint_lpf).abs() / 40.0
+        ).clamp_min(0.0)
+        iterm_error[:, :2] *= iterm_relax_factor[:, :2]
+        self._iterm = (
+            self._iterm + self._ki * interval_s * iterm_error
+        ).clamp(-400.0, 400.0)
+
+        previous_filtered_gyro = self._dterm_lpf2.clone()
+        self._advance_cascade_constant(
+            gyro_rate_dps,
+            (self._dterm_lpf1, self._dterm_lpf2),
+            (self._dterm_lpf1_gain, self._dterm_lpf2_gain),
+            inner_ticks,
+        )
+        derivative = -(self._dterm_lpf2 - previous_filtered_gyro) / interval_s
+        setpoint_delta_per_tick = (
+            current_setpoint_dps - self._previous_setpoint_dps
+        ) / inner_ticks
+        self._advance_cascade_constant(
+            derivative,
+            (self._dmin_range_state1, self._dmin_range_state),
+            (self._dmin_range_gain, self._dmin_range_gain),
+            inner_ticks,
+        )
+        dynamic_d = torch.maximum(
+            self._dmin_range_state.abs() * self._dmin_gyro_gain,
+            setpoint_delta_per_tick.abs() * self._dmin_setpoint_gain,
+        )
+        dmin_target = self._dmin_percent + (1.0 - self._dmin_percent) * dynamic_d
+        self._advance_cascade_constant(
+            dmin_target,
+            (self._dmin_lowpass_state1, self._dmin_lowpass_state),
+            (self._dmin_lowpass_gain, self._dmin_lowpass_gain),
+            inner_ticks,
+        )
+        dmin_factor = torch.where(
+            self._dmin_enabled,
+            self._dmin_lowpass_state.clamp(max=1.0),
+            torch.ones_like(self._dmin_lowpass_state),
+        )
+        d_term = self._kd * derivative * dmin_factor * tpa_factor[:, None]
+
+        f_term = self._kf * self._ff_delta / self.dt_s
+        limit = self._feedforward_max_rate * (
+            self.profile.feedforward_max_rate_limit / 100.0
+        )
+        same_direction = f_term * average_setpoint_dps > 0.0
+        below_limit = average_setpoint_dps.abs() <= limit
+        lower = (-limit - average_setpoint_dps) * self._kp
+        upper = (limit - average_setpoint_dps) * self._kp
+        f_term = torch.where(
+            same_direction & below_limit,
+            torch.maximum(torch.minimum(f_term, upper), lower),
+            f_term,
+        )
+        f_term[:, 2] = self._kf[2] * self._ff_delta[:, 2] / self.dt_s
+        _, average_f_term = self._advance_cascade_constant(
+            f_term,
+            (self._ff_lpf_state1, self._ff_lpf_state2, self._ff_lpf_state),
+            (
+                self._rc_smoothing_feedforward_gain,
+                self._rc_smoothing_feedforward_gain,
+                self._rc_smoothing_feedforward_gain,
+            ),
+            inner_ticks,
+            return_average=True,
+        )
+        assert average_f_term is not None
+
+        self._previous_gyro_dps.copy_(self._dterm_lpf2)
+        self._previous_setpoint_dps.copy_(current_setpoint_dps)
+        pid_sum = p_term + self._iterm + d_term + average_f_term
+        self._last_rate_setpoint_dps.copy_(current_setpoint_dps)
+        self._last_gyro_rate_dps.copy_(gyro_rate_dps)
+        self._last_rate_error_dps.copy_(current_setpoint_dps - gyro_rate_dps)
+        self._last_pid_sum.copy_(pid_sum)
+        self._last_inner_ticks = inner_ticks
+        return RateLoopAdvance(pid_sum=pid_sum, inner_ticks=inner_ticks)
 
     def diagnostics(self) -> dict[str, torch.Tensor | int]:
         return {

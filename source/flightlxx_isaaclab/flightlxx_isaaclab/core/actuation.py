@@ -114,6 +114,11 @@ class MotorActuator:
         self.rate_limit = torch.tensor(cfg.max_body_rate, device=self.device)
         self.kp = torch.tensor(cfg.rate_kp, device=self.device)
         self.torque_limit = torch.tensor(cfg.torque_limit, device=self.device)
+        self._rpm_official_max = torch.tensor(cfg.rpm_official_max, device=self.device)
+        self._policy_rpm_ceiling = torch.tensor(
+            cfg.rpm_official_max * cfg.policy_rpm_fraction,
+            device=self.device,
+        )
         lever = cfg.arm_length / math.sqrt(2.0)
         yaw = cfg.yaw_moment_coefficient
         self.allocation = torch.tensor(
@@ -121,6 +126,16 @@ class MotorActuator:
             device=self.device,
         )
         self.allocation_inverse = torch.linalg.inv(self.allocation)
+        self._pid_limit = torch.tensor((500.0, 500.0, 400.0), device=self.device)
+        self._betaflight_mixer = torch.tensor(
+            (
+                (1.0, -1.0, 1.0),
+                (-1.0, -1.0, -1.0),
+                (-1.0, 1.0, 1.0),
+                (1.0, 1.0, -1.0),
+            ),
+            device=self.device,
+        )
         self.motor_rpm = torch.zeros(num_envs, 4, device=self.device)
         self._last_hardware_rpm_limit = torch.zeros(num_envs, device=self.device)
         self._last_policy_rpm_limit = torch.zeros(num_envs, device=self.device)
@@ -173,11 +188,8 @@ class MotorActuator:
         total_current = current_fraction.sum(dim=-1) * self.cfg.max_current_per_motor_a
         loaded_voltage = (self.battery_voltage_v - total_current * self.battery_internal_resistance_ohm).clamp_min(0.0)
         electrical_rpm = loaded_voltage * self.cfg.motor_kv_rpm_per_v
-        hardware = torch.minimum(electrical_rpm, torch.full_like(electrical_rpm, self.cfg.rpm_official_max))
-        policy = torch.minimum(
-            hardware,
-            torch.full_like(hardware, self.cfg.rpm_official_max * self.cfg.policy_rpm_fraction),
-        )
+        hardware = torch.minimum(electrical_rpm, self._rpm_official_max)
+        policy = torch.minimum(hardware, self._policy_rpm_ceiling)
         return hardware, policy
 
     def reset(self, env_ids: torch.Tensor) -> None:
@@ -188,7 +200,7 @@ class MotorActuator:
         self._last_hardware_rpm_limit[env_ids] = hardware[env_ids]
         self._last_policy_rpm_limit[env_ids] = torch.minimum(
             hardware[env_ids],
-            torch.full_like(hardware[env_ids], self.cfg.rpm_official_max * self.cfg.policy_rpm_fraction),
+            self._policy_rpm_ceiling,
         )
         self._last_motor_thrust[env_ids] = self.thrust_coefficient[env_ids] * self.motor_rpm[env_ids].square()
         self._last_governor_scale[env_ids] = 1.0
@@ -225,7 +237,7 @@ class MotorActuator:
         self._last_policy_rpm_limit.copy_(policy_rpm)
         self._last_motor_thrust.copy_(motor_thrust)
         self._last_governor_scale.copy_(torch.where(policy_total > 0.0, desired_total / policy_total, torch.ones_like(policy_total)).clamp(max=1.0))
-        return wrench[:, :1].clone(), wrench[:, 1:].clone()
+        return wrench[:, :1], wrench[:, 1:]
 
     def step_betaflight(self, action: torch.Tensor, pid_sum: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply firmware PID sums through the Betaflight quad-X motor mixer.
@@ -249,13 +261,10 @@ class MotorActuator:
         baseline_output = torch.sqrt(
             desired_total[:, None] / (4.0 * self.thrust_coefficient)
         ) / hardware_rpm[:, None]
-        pid_limit = torch.tensor((500.0, 500.0, 400.0), device=self.device)
-        scaled_pid = pid_sum.clamp(-pid_limit, pid_limit) / 1000.0
-        mixer = torch.tensor(
-            ((1.0, -1.0, 1.0), (-1.0, -1.0, -1.0), (-1.0, 1.0, 1.0), (1.0, 1.0, -1.0)),
-            device=self.device,
-        )
-        desired_output = (baseline_output + scaled_pid @ mixer.T).clamp(0.0, 1.0)
+        scaled_pid = pid_sum.clamp(-self._pid_limit, self._pid_limit) / 1000.0
+        desired_output = (
+            baseline_output + scaled_pid @ self._betaflight_mixer.T
+        ).clamp(0.0, 1.0)
         desired_rpm = desired_output * hardware_rpm[:, None]
         spinning_up = desired_rpm >= self.motor_rpm
         tau = torch.where(
@@ -272,13 +281,16 @@ class MotorActuator:
         self._last_policy_rpm_limit.copy_(policy_rpm)
         self._last_motor_thrust.copy_(motor_thrust)
         self._last_governor_scale.copy_(torch.where(policy_total > 0.0, desired_total / policy_total, torch.ones_like(policy_total)).clamp(max=1.0))
-        return wrench[:, :1].clone(), wrench[:, 1:].clone()
+        return wrench[:, :1], wrench[:, 1:]
 
-    def diagnostics(self) -> dict[str, torch.Tensor]:
-        return {
-            "hardware_rpm_limit": self._last_hardware_rpm_limit.clone(),
-            "policy_rpm_limit": self._last_policy_rpm_limit.clone(),
-            "motor_rpm": self.motor_rpm.clone(),
-            "motor_thrust_n": self._last_motor_thrust.clone(),
-            "policy_governor_scale": self._last_governor_scale.clone(),
+    def diagnostics(self, *, copy: bool = True) -> dict[str, torch.Tensor]:
+        values = {
+            "hardware_rpm_limit": self._last_hardware_rpm_limit,
+            "policy_rpm_limit": self._last_policy_rpm_limit,
+            "motor_rpm": self.motor_rpm,
+            "motor_thrust_n": self._last_motor_thrust,
+            "policy_governor_scale": self._last_governor_scale,
         }
+        if copy:
+            return {name: value.clone() for name, value in values.items()}
+        return values
