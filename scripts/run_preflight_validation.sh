@@ -23,22 +23,25 @@ RESUME="${RESUME:-1}"
 SMOKE="${SMOKE:-0}"
 TRIAL_IDS="${TRIAL_IDS:-}"
 ALLOW_DURING_TRAINING="${ALLOW_DURING_TRAINING:-0}"
-TASK_OUTPUT_ROOT="${TASK_OUTPUT_ROOT:-$FLIGHTLXX_DIR/outputs/training/Isaac-FlightLxx-CTBR-Recovery-Direct-v0}"
+TASK_OUTPUT_ROOT="${TASK_OUTPUT_ROOT:-$FLIGHTLXX_DIR/outputs/ppo}"
 MANIFEST="${MANIFEST:-$FLIGHTLXX_DIR/source/flightlxx_isaaclab/flightlxx_isaaclab/config/preflight_validation_v1.json}"
 
 if [[ "$ALLOW_DURING_TRAINING" != "1" ]] \
-    && pgrep -f 'train.py.*Isaac-FlightLxx-CTBR-Recovery-Direct-v0' >/dev/null; then
+    && pgrep -f '[t]rain_ppo.py' >/dev/null; then
     echo "检测到训练进程。全面验证默认不与训练争抢GPU。" >&2
     echo "等待训练结束，或明确设置 ALLOW_DURING_TRAINING=1。" >&2
     exit 3
 fi
 
+if [[ -n "$CHECKPOINT" && -z "$RUN_DIR" ]]; then
+    RUN_DIR="$(dirname "$(dirname "$CHECKPOINT")")"
+fi
 if [[ -z "$RUN_DIR" ]]; then
     RUN_DIR="$(find "$TASK_OUTPUT_ROOT" -mindepth 1 -maxdepth 1 -type d \
         -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
 fi
 if [[ -z "$CHECKPOINT" ]]; then
-    if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR/checkpoints" ]]; then
+    if [[ -z "$CHECKPOINT" && ( -z "$RUN_DIR" || ! -d "$RUN_DIR/checkpoints" ) ]]; then
         echo "未找到训练目录；请设置 CHECKPOINT 或 RUN_DIR。" >&2
         exit 2
     fi
@@ -98,5 +101,5 @@ echo "checkpoint=$CHECKPOINT"
 echo "manifest=$MANIFEST"
 echo "output_dir=$OUTPUT_DIR"
 echo "device=$DEVICE resume=$RESUME smoke=$SMOKE"
-cd "$FASTTD3_DIR/fast_td3"
+cd "$FLIGHTLXX_DIR"
 "$ISAACLAB_DIR/isaaclab.sh" -p "$FLIGHTLXX_DIR/scripts/evaluate_preflight_suite.py" "${runner_args[@]}" "$@"

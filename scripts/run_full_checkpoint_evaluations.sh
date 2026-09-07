@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_DIR='/home/lu/FlightLxx-IsaacLab/outputs/training/Isaac-FlightLxx-CTBR-Recovery-Direct-v0/20260827_010721_seed1'
+RUN_DIR="${RUN_DIR:?Set RUN_DIR to a PPO training run}"
 PROJECT='/home/lu/FlightLxx-IsaacLab'
 EVAL_ROOT="$RUN_DIR/manual_evaluations"
 LOG_DIR="$EVAL_ROOT/six_hour_full_evaluation_logs"

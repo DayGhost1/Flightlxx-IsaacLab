@@ -203,31 +203,11 @@ def main():
     import torch
 
     import flightlxx_isaaclab.tasks  # noqa: F401
-    from fast_td3_utils import EmpiricalNormalization
     from flightlxx_isaaclab.core import assess_curriculum_exam
-    from flightlxx_isaaclab.fast_td3_models import HistoryActor, POLICY_RAW_DIM
+    from flightlxx_isaaclab.ppo import load_ppo_policy
     from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
-    checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
-    saved = checkpoint["args"]
-    actor = HistoryActor(
-        n_obs=POLICY_RAW_DIM,
-        n_act=4,
-        num_envs=args.num_envs,
-        device=args.device,
-        init_scale=float(saved.get("init_scale", 0.01)),
-        hidden_dim=int(saved.get("actor_hidden_dim", 512)),
-        std_min=float(saved.get("std_min", 0.0)),
-        std_max=float(saved.get("std_max", 0.2)),
-        sim_type=str(saved.get("sim_type", "")),
-        sim_dimension=int(saved.get("sim_dimension", 64)),
-        seq_len=int(saved.get("actor_seq_len", 8)),
-    )
-    actor.load_state_dict(checkpoint["actor_state_dict"])
-    actor.eval()
-    normalizer = EmpiricalNormalization(POLICY_RAW_DIM, args.device)
-    normalizer.load_state_dict(checkpoint["obs_normalizer_state"])
-    normalizer.eval()
+    actor, normalizer, checkpoint_step = load_ppo_policy(args.checkpoint, args.device)
 
     cfg = parse_env_cfg(TASK_NAME, device=args.device, num_envs=args.num_envs)
     cfg.seed = 1
@@ -283,7 +263,7 @@ def main():
     }
     payload = {
         "checkpoint": str(args.checkpoint),
-        "checkpoint_step": int(checkpoint.get("global_step", 0)),
+        "checkpoint_step": checkpoint_step,
         "dr_mode": args.dr_mode,
         "velocity_lpf_tau_s": (
             float(args.velocity_lpf_tau_s) if args.dr_mode == "vicon_realistic_lpf" else None

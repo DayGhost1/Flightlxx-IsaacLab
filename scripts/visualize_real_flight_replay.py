@@ -35,9 +35,8 @@ else:
     import omni.ui as ui  # noqa: E402
 
 import flightlxx_isaaclab.tasks  # noqa: E402,F401
-from fast_td3_utils import EmpiricalNormalization  # noqa: E402
 from flightlxx_isaaclab.evaluation import FixedImpact, FixedImpactProtocol  # noqa: E402
-from flightlxx_isaaclab.fast_td3_models import HistoryActor, POLICY_RAW_DIM  # noqa: E402
+from flightlxx_isaaclab.ppo import load_ppo_policy
 from flightlxx_isaaclab.real_flight_replay import (  # noqa: E402
     DEPLOYED_50K_SHA256,
     ObservationDelay,
@@ -148,28 +147,7 @@ class DirectAdapter:
 
 
 def load_actor(checkpoint_path: Path, device: str):
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    saved = checkpoint["args"]
-    actor = HistoryActor(
-        n_obs=POLICY_RAW_DIM,
-        n_act=4,
-        num_envs=int(saved["num_envs"]),
-        device=device,
-        init_scale=float(saved.get("init_scale", 0.01)),
-        hidden_dim=int(saved.get("actor_hidden_dim", 512)),
-        std_min=float(saved.get("std_min", 0.05)),
-        std_max=float(saved.get("std_max", 0.20)),
-        sim_type=str(saved.get("sim_type", "")),
-        sim_dimension=int(saved.get("sim_dimension", 64)),
-        seq_len=int(saved.get("actor_seq_len", 8)),
-    )
-    actor.load_state_dict(checkpoint["actor_state_dict"])
-    actor.eval()
-    normalizer = EmpiricalNormalization(shape=POLICY_RAW_DIM, device=device)
-    if checkpoint.get("obs_normalizer_state"):
-        normalizer.load_state_dict(checkpoint["obs_normalizer_state"])
-    normalizer.eval()
-    return actor, normalizer, int(checkpoint.get("global_step", 0))
+    return load_ppo_policy(checkpoint_path, device)
 
 
 def no_impact_protocol(duration_s: float) -> FixedImpactProtocol:

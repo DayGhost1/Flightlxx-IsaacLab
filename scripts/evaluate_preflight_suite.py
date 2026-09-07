@@ -360,8 +360,7 @@ def main() -> None:
 
     import flightlxx_isaaclab
     import flightlxx_isaaclab.tasks  # noqa: F401
-    from fast_td3_utils import EmpiricalNormalization
-    from flightlxx_isaaclab.fast_td3_models import HistoryActor, POLICY_RAW_DIM
+    from flightlxx_isaaclab.ppo import load_ppo_policy
     from flightlxx_isaaclab.preflight_protocol import load_preflight_manifest
     from flightlxx_isaaclab.preflight_report import (
         qualify_preflight,
@@ -389,27 +388,7 @@ def main() -> None:
         raise RuntimeError("existing output directory contains a different resolved manifest")
     resolved_manifest_path.write_text(resolved_json, encoding="utf-8")
 
-    checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=False)
-    saved_args = checkpoint["args"]
-    actor = HistoryActor(
-        n_obs=POLICY_RAW_DIM,
-        n_act=4,
-        num_envs=int(saved_args["num_envs"]),
-        device=args.device,
-        init_scale=float(saved_args.get("init_scale", 0.01)),
-        hidden_dim=int(saved_args.get("actor_hidden_dim", 512)),
-        std_min=float(saved_args.get("std_min", 0.05)),
-        std_max=float(saved_args.get("std_max", 0.20)),
-        sim_type=str(saved_args.get("sim_type", "")),
-        sim_dimension=int(saved_args.get("sim_dimension", 64)),
-        seq_len=int(saved_args.get("actor_seq_len", 8)),
-    )
-    actor.load_state_dict(checkpoint["actor_state_dict"])
-    actor.eval()
-    normalizer = EmpiricalNormalization(shape=POLICY_RAW_DIM, device=args.device)
-    if checkpoint.get("obs_normalizer_state"):
-        normalizer.load_state_dict(checkpoint["obs_normalizer_state"])
-    normalizer.eval()
+    actor, normalizer, checkpoint_step = load_ppo_policy(checkpoint_path, args.device)
 
     cfg = parse_env_cfg(TASK_NAME, device=args.device, num_envs=1)
     cfg.seed = 1
@@ -417,7 +396,7 @@ def main() -> None:
     metadata = {
         "protocol_id": manifest.protocol_id,
         "checkpoint": str(checkpoint_path),
-        "checkpoint_step": int(checkpoint.get("global_step", 0)),
+        "checkpoint_step": checkpoint_step,
         "checkpoint_sha256": _sha256(checkpoint_path),
         "resolved_manifest_sha256": hashlib.sha256(manifest.to_json().encode("utf-8")).hexdigest(),
         "evaluator_sha256": _sha256(Path(__file__).resolve()),

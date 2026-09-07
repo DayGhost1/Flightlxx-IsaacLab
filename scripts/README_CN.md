@@ -1,3 +1,11 @@
+# CTBR-PPO 分支
+
+本分支默认训练器已切换为 **PyTorch / RSL-RL PPO**。训练、续训、评估和导出命令见 [PPO 使用说明](../PPO_README.md)。
+
+以下是历史版本说明，涉及 TensorFlow、FastTD3 和旧 checkpoint 的命令不适用于本分支默认流程。
+
+---
+
 # FlightLxx-IsaacLab 训练与评测操作手册
 
 本文只说明日常操作。所有命令都在 4090 主机的项目根目录执行：

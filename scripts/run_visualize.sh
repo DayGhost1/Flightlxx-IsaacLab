@@ -24,7 +24,7 @@ WARMUP_UPDATES="${WARMUP_UPDATES:-180}"
 AUTO_START="${AUTO_START:-1}"
 EXIT_AFTER_RUN="${EXIT_AFTER_RUN:-0}"
 OPEN_REPORT="${OPEN_REPORT:-1}"
-TASK_OUTPUT_ROOT="${TASK_OUTPUT_ROOT:-$FLIGHTLXX_DIR/outputs/training/Isaac-FlightLxx-CTBR-Recovery-Direct-v0}"
+TASK_OUTPUT_ROOT="${TASK_OUTPUT_ROOT:-$FLIGHTLXX_DIR/outputs/ppo}"
 RUN_DIR="${RUN_DIR:-}"
 CHECKPOINT="${CHECKPOINT:-}"
 
@@ -34,17 +34,20 @@ case "$IMPACT_LEVEL" in
 esac
 
 if [[ "$ALLOW_DURING_TRAINING" != "1" ]] \
-    && pgrep -f 'train.py.*Isaac-FlightLxx-CTBR-Recovery-Direct-v0' >/dev/null; then
+    && pgrep -f '[t]rain_ppo.py' >/dev/null; then
     echo "A FlightLxx training process is active. GUI playback is blocked to avoid GPU contention." >&2
     echo "Wait for training to finish, or explicitly set ALLOW_DURING_TRAINING=1." >&2
     exit 3
 fi
 
+if [[ -n "$CHECKPOINT" && -z "$RUN_DIR" ]]; then
+    RUN_DIR="$(dirname "$(dirname "$CHECKPOINT")")"
+fi
 if [[ -z "$RUN_DIR" ]]; then
     RUN_DIR="$(find "$TASK_OUTPUT_ROOT" -mindepth 1 -maxdepth 1 -type d \
         -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
 fi
-if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR/checkpoints" ]]; then
+if [[ -z "$CHECKPOINT" && ( -z "$RUN_DIR" || ! -d "$RUN_DIR/checkpoints" ) ]]; then
     echo "No valid training run was found. Set RUN_DIR to a timestamped run directory." >&2
     exit 2
 fi
@@ -96,6 +99,6 @@ echo "output_dir=$OUTPUT_DIR"
 echo "speed=$SPEED auto_start=$AUTO_START exit_after_run=$EXIT_AFTER_RUN"
 echo "impact_level=$IMPACT_LEVEL"
 
-cd "$FASTTD3_DIR/fast_td3"
+cd "$FLIGHTLXX_DIR"
 "$ISAACLAB_DIR/isaaclab.sh" -p "$FLIGHTLXX_DIR/scripts/visualize_fixed_impacts.py" \
     "${visual_args[@]}" "$@"

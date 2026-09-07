@@ -39,10 +39,9 @@ from pxr import Gf, Usd, UsdGeom  # noqa: E402
 
 import flightlxx_isaaclab  # noqa: E402
 import flightlxx_isaaclab.tasks  # noqa: E402,F401
-from fast_td3_utils import EmpiricalNormalization  # noqa: E402
-from fixed_impact_evaluation import evaluate_fixed_five_impacts  # noqa: E402
+from flightlxx_isaaclab.fixed_impact_evaluation import evaluate_fixed_five_impacts  # noqa: E402
 from flightlxx_isaaclab.evaluation import load_fixed_protocol, protocol_for_impact_level  # noqa: E402
-from flightlxx_isaaclab.fast_td3_models import HistoryActor, POLICY_RAW_DIM  # noqa: E402
+from flightlxx_isaaclab.ppo import load_ppo_policy
 from flightlxx_isaaclab.visual_playback import (  # noqa: E402
     PlaybackState,
     configure_visual_scene,
@@ -327,30 +326,7 @@ def open_report(path: Path | None) -> None:
 
 
 def load_actor_and_normalizer(checkpoint_path: Path, device: str):
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    saved_args = checkpoint["args"]
-    actor = HistoryActor(
-        n_obs=POLICY_RAW_DIM,
-        n_act=4,
-        num_envs=int(saved_args["num_envs"]),
-        device=device,
-        init_scale=float(saved_args.get("init_scale", 0.01)),
-        hidden_dim=int(saved_args.get("actor_hidden_dim", 512)),
-        std_min=float(saved_args.get("std_min", 0.05)),
-        std_max=float(saved_args.get("std_max", 0.20)),
-        sim_type=str(saved_args.get("sim_type", "")),
-        sim_dimension=int(saved_args.get("sim_dimension", 64)),
-        seq_len=int(saved_args.get("actor_seq_len", 8)),
-    )
-    actor.load_state_dict(checkpoint["actor_state_dict"])
-    actor.eval()
-
-    normalizer = EmpiricalNormalization(shape=POLICY_RAW_DIM, device=device)
-    normalizer_state = checkpoint.get("obs_normalizer_state")
-    if normalizer_state:
-        normalizer.load_state_dict(normalizer_state)
-    normalizer.eval()
-    return actor, normalizer, int(checkpoint.get("global_step", 0))
+    return load_ppo_policy(checkpoint_path, device)
 
 
 def main() -> None:

@@ -5,17 +5,20 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=project_env.sh
 source "$SCRIPT_DIR/project_env.sh"
 
-TASK_OUTPUT_ROOT="${TASK_OUTPUT_ROOT:-$FLIGHTLXX_DIR/outputs/training/Isaac-FlightLxx-CTBR-Recovery-Direct-v0}"
+TASK_OUTPUT_ROOT="${TASK_OUTPUT_ROOT:-$FLIGHTLXX_DIR/outputs/ppo}"
 RUN_DIR="${RUN_DIR:-}"
 CHECKPOINT="${CHECKPOINT:-}"
 IMPACT_LEVEL="${IMPACT_LEVEL:-small}"
 DEVICE="${DEVICE:-cuda:0}"
 
+if [[ -n "$CHECKPOINT" && -z "$RUN_DIR" ]]; then
+    RUN_DIR="$(dirname "$(dirname "$CHECKPOINT")")"
+fi
 if [[ -z "$RUN_DIR" ]]; then
     RUN_DIR="$(find "$TASK_OUTPUT_ROOT" -mindepth 1 -maxdepth 1 -type d \
         -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
 fi
-if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR/checkpoints" ]]; then
+if [[ -z "$CHECKPOINT" && ( -z "$RUN_DIR" || ! -d "$RUN_DIR/checkpoints" ) ]]; then
     echo "No valid training run was found. Set RUN_DIR explicitly." >&2
     exit 2
 fi

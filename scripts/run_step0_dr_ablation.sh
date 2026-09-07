@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Step-0 DR ablation on the final 296k exam checkpoint.
+# Step-0 DR ablation on a selected PPO checkpoint.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=project_env.sh
 source "$SCRIPT_DIR/project_env.sh"
 
-CHECKPOINT="${CHECKPOINT:-$FLIGHTLXX_DIR/outputs/training/Isaac-FlightLxx-CTBR-Recovery-Direct-v0/20260903_032737_seed1/checkpoints/exam_074_step_00295999.pt}"
-OUT_DIR="${OUT_DIR:-$FLIGHTLXX_DIR/outputs/dr_ablation/exam_074_step_00295999}"
+CHECKPOINT="${CHECKPOINT:?Set CHECKPOINT to a PPO checkpoint}"
+OUT_DIR="${OUT_DIR:-$FLIGHTLXX_DIR/outputs/ppo-dr-ablation}"
 DEVICE="${DEVICE:-cuda:0}"
 NUM_ENVS="${NUM_ENVS:-1024}"
 MODES="${MODES:-vicon vicon_realistic vicon_realistic_lpf full}"
@@ -15,7 +15,7 @@ MODES="${MODES:-vicon vicon_realistic vicon_realistic_lpf full}"
 mkdir -p "$OUT_DIR"
 test -f "$CHECKPOINT" || { echo "Missing checkpoint: $CHECKPOINT" >&2; exit 2; }
 
-cd "$FASTTD3_DIR/fast_td3"
+cd "$FLIGHTLXX_DIR"
 for mode in $MODES; do
   echo "===== DR mode: $mode ====="
   "$ISAACLAB_DIR/isaaclab.sh" -p "$FLIGHTLXX_DIR/scripts/dr_ablation_eval.py" \

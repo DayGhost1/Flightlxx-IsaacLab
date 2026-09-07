@@ -17,7 +17,7 @@ CHECKPOINT_STEP="${CHECKPOINT_STEP:-latest}"
 IMPACT_LEVEL="${IMPACT_LEVEL:-small}"
 ALLOW_DURING_TRAINING="${ALLOW_DURING_TRAINING:-0}"
 DEVICE="${DEVICE:-cuda:0}"
-TASK_OUTPUT_ROOT="${TASK_OUTPUT_ROOT:-$FLIGHTLXX_DIR/outputs/training/Isaac-FlightLxx-CTBR-Recovery-Direct-v0}"
+TASK_OUTPUT_ROOT="${TASK_OUTPUT_ROOT:-$FLIGHTLXX_DIR/outputs/ppo}"
 RUN_DIR="${RUN_DIR:-}"
 CHECKPOINT="${CHECKPOINT:-}"
 
@@ -27,18 +27,21 @@ case "$IMPACT_LEVEL" in
 esac
 
 if [[ "$ALLOW_DURING_TRAINING" != "1" ]] \
-    && pgrep -f 'train.py.*Isaac-FlightLxx-CTBR-Recovery-Direct-v0' >/dev/null; then
+    && pgrep -f '[t]rain_ppo.py' >/dev/null; then
     echo "A FlightLxx training process is active. Manual evaluation is blocked to avoid GPU contention." >&2
-    echo "The trainer already evaluates every saved checkpoint automatically." >&2
+    echo "PPO curriculum exams run in training; fixed-impact evaluation is a separate command." >&2
     echo "Wait for training to finish, or explicitly set ALLOW_DURING_TRAINING=1." >&2
     exit 3
 fi
 
+if [[ -n "$CHECKPOINT" && -z "$RUN_DIR" ]]; then
+    RUN_DIR="$(dirname "$(dirname "$CHECKPOINT")")"
+fi
 if [[ -z "$RUN_DIR" ]]; then
     RUN_DIR="$(find "$TASK_OUTPUT_ROOT" -mindepth 1 -maxdepth 1 -type d \
         -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
 fi
-if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR/checkpoints" ]]; then
+if [[ -z "$CHECKPOINT" && ( -z "$RUN_DIR" || ! -d "$RUN_DIR/checkpoints" ) ]]; then
     echo "No valid training run was found. Set RUN_DIR to a timestamped run directory." >&2
     exit 2
 fi
@@ -78,7 +81,7 @@ echo "output_dir=$OUTPUT_DIR"
 echo "device=$DEVICE"
 echo "impact_level=$IMPACT_LEVEL"
 
-cd "$FASTTD3_DIR/fast_td3"
+cd "$FLIGHTLXX_DIR"
 "$ISAACLAB_DIR/isaaclab.sh" -p "$FLIGHTLXX_DIR/scripts/evaluate_fixed_impacts_headless.py" \
     --checkpoint "$CHECKPOINT" \
     --output_dir "$OUTPUT_DIR" \

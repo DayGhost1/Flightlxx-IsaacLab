@@ -1,4 +1,4 @@
-"""Evaluate one FastTD3 checkpoint with the deterministic five-impact protocol."""
+"""Evaluate one PPO checkpoint with the deterministic five-impact protocol."""
 
 from __future__ import annotations
 
@@ -44,10 +44,9 @@ def main() -> None:
 
     import flightlxx_isaaclab
     import flightlxx_isaaclab.tasks  # noqa: F401
-    from fast_td3_utils import EmpiricalNormalization
-    from fixed_impact_evaluation import evaluate_fixed_five_impacts
+    from flightlxx_isaaclab.fixed_impact_evaluation import evaluate_fixed_five_impacts
     from flightlxx_isaaclab.evaluation import load_fixed_protocol, protocol_for_impact_level
-    from flightlxx_isaaclab.fast_td3_models import HistoryActor, POLICY_RAW_DIM
+    from flightlxx_isaaclab.ppo import load_ppo_policy
     from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
     class DirectGymPolicyAdapter:
@@ -64,33 +63,12 @@ def main() -> None:
             return observations["policy"], rewards, terminated | truncated, info
 
     checkpoint_path = args.checkpoint.expanduser().resolve()
-    checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=False)
-    saved_args = checkpoint["args"]
-    actor = HistoryActor(
-        n_obs=POLICY_RAW_DIM,
-        n_act=4,
-        num_envs=int(saved_args["num_envs"]),
-        device=args.device,
-        init_scale=float(saved_args.get("init_scale", 0.01)),
-        hidden_dim=int(saved_args.get("actor_hidden_dim", 512)),
-        std_min=float(saved_args.get("std_min", 0.05)),
-        std_max=float(saved_args.get("std_max", 0.20)),
-        sim_type=str(saved_args.get("sim_type", "")),
-        sim_dimension=int(saved_args.get("sim_dimension", 64)),
-        seq_len=int(saved_args.get("actor_seq_len", 8)),
-    )
-    actor.load_state_dict(checkpoint["actor_state_dict"])
-    actor.eval()
-    normalizer = EmpiricalNormalization(shape=POLICY_RAW_DIM, device=args.device)
-    if checkpoint.get("obs_normalizer_state"):
-        normalizer.load_state_dict(checkpoint["obs_normalizer_state"])
-    normalizer.eval()
+    actor, normalizer, checkpoint_step = load_ppo_policy(checkpoint_path, args.device)
 
     cfg = parse_env_cfg(TASK_NAME, device=args.device, num_envs=1)
     cfg.seed = 1
     gym_env = gym.make(TASK_NAME, cfg=cfg)
     env = DirectGymPolicyAdapter(gym_env)
-    checkpoint_step = int(checkpoint.get("global_step", 0))
     base_protocol = load_fixed_protocol(
         Path(flightlxx_isaaclab.__file__).parent / "config" / "fixed_five_impacts.json"
     )
