@@ -35,11 +35,7 @@ TOTAL_TIMESTEPS=2000 NUM_ENVS=256 BUFFER_SIZE=1024 BATCH_SIZE=4096 \
 | `SAVE_INTERVAL` | 25000 | checkpoint 保存及自动五冲击评测间隔 |
 | `LOG_INTERVAL` | 100 | 终端、CSV、TensorBoard 记录间隔 |
 | `LEARNING_STARTS` | 10 | 开始更新网络前的采样步数 |
-| `REPLAY_BAND_FRACTIONS` | `0.10 0.15 0.20 0.35 0.10` | Replay 每批无撞击/简单/中间/当前/探测层的目标比例 |
-| `FAILURE_CONTEXT_FRACTION` | 0.10 | 失败前后文的独立目标比例 |
-| `FAILURE_CONTEXT_STEPS` | 50 | 失败前最多回溯步数（20 ms 控制周期下为 1 s） |
-| `ACTIVE_IMPACT_FRACTION` | 0.05 | 每批中正在受力的稀有 transition 目标比例 |
-| `RECOVERY_PHASE_FRACTION` | 0.20 | 每批中撞击后前 2 s 恢复 transition 的目标比例 |
+| `CURRICULUM_MIX_FRACTIONS` | `0.30 0.50 0.20` | Replay 每批 mastered/boundary/probe 层的固定比例；每层内部按实际存在的 A/B/C cell 均衡抽样 |
 | `OUTPUT_ROOT` | `outputs/training` | 时间戳训练目录根路径 |
 
 额外 FastTD3 命令行参数可以直接附加：
@@ -77,16 +73,16 @@ $PYTHON_EXECUTABLE -m tensorboard --logdir \
 
 主机浏览器打开 `http://127.0.0.1:6006`。常用指标包括 episode return、恢复成功率、精细悬停成功率、撞地率、稳态误差、课程难度、Q loss、Q1/Q2 gap、support 边界概率、Actor/Critic 梯度范数以及 `Replay/*` 分层比例。某些 episode 指标只在环境完成或 reset 后才更新；短时间为 0 不一定表示日志失效，应结合环境终止次数和原始 `logs/progress.csv` 判断。
 
-自动课程不再使用精细悬停标准直接晋级。它根据连续统计窗自动升降级，不需要手动切换：
+自动课程不再用一个总难度同时控制所有问题，也不再使用精细悬停标准直接晋级。它把接管状态、单次撞击强度和连续撞击次数分别记为 A/B/C 三条难度轴：
 
 - **课程恢复标准**：位置 `< 0.15 m`、线速度 `< 0.15 m/s`、姿态 `< 5°`、角速度 `< 0.25 rad/s`，连续 0.5 s；只用于判断是否可以提高难度。
 - **精细悬停标准**：位置 `< 0.05 m`、线速度 `< 0.05 m/s`、姿态 `< 2°`、角速度 `< 0.05 rad/s`，连续 2.0 s；只作为最终稳定性的严格训练指标。
-- **在线任务组成**：15% 无撞击、15% 简单档 `U(0, 0.3d)`、25% 中间档 `U(0.3d, 0.7d)`、35% 当前档 `U(0.7d, d)`、10% 下一档探测；`d` 是当前课程难度。
-- **晋级**：无撞击成功率、当前档成功率/撞击率和探测档成功率连续 3 个统计窗满足门槛，`d += 0.05`。
-- **降级**：当前档成功率过低或撞击率过高连续 3 个统计窗成立，`d -= 0.025`；最低为 0.10，改变难度后冷却 5000 global steps。
-- **Replay 六类互斥采样**：10% 无撞击、15% 简单、20% 中间、35% 当前、10% 探测、10% 失败前后文；此外保证约 5% 正在施力、20% 撞击后前 2 s 恢复片段。某类不足时回退采样并记录 `Replay/fallback_fraction`。
+- **在线任务组成**：30% 已掌握层、50% 当前边界层、20% 下一层探针；每层在当时实际存在的 A、B、C 单轴 cell 和必要的 AB/AC/BC 交互 cell 间轮转，已经学会的中间等级不会消失。
+- **独立晋级/降级**：每个 cell 累积 512 个 episode 后计算 `0.8 × 恢复率 + 0.2 × (1 - 撞毁率)`；某一轴的边界和探针连续 3 窗达到 0.75 才只提升该轴，边界连续 3 窗低于 0.55 才只降低该轴。
+- **交互诊断**：单轴表现合格但组合探针失败时，只把对应 AB/AC/BC 组合加入边界训练；它不会错误地让三个轴一起降级。
+- **Replay 采样**：每个 batch 固定保持 30/50/20，并在每个层内按实际存在的课程 cell 均衡；失败、受力和恢复阶段继续作为诊断标签保存，但不再各自抢占独立硬配额。
 
-`Curriculum/difficulty` 允许小步升降；`Curriculum/mastered_difficulty` 只记录曾经满足晋级条件的最高难度。结合 `promotion_count`、`demotion_count`、`last_action`、三个档位成功率和撞击率判断课程是否正常。`Replay/occupancy_*` 是缓冲区真实构成，`Replay/sample_*` 是最近一次 batch 的真实构成，两者不是同一个概念。
+`Curriculum/a_*`、`b_*`、`c_*` 分别显示三条轴的 frontier、mastered、升降级次数和最近动作。`Replay/occupancy_*` 是缓冲区真实构成，`Replay/sample_*` 是最近一次 batch 的真实构成，两者不是同一个概念。
 
 终端实时看 GPU：
 

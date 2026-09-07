@@ -14,7 +14,7 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--checkpoint", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
-parser.add_argument("--duration", type=float, default=3.0)
+parser.add_argument("--duration", type=float, default=20.0)
 parser.add_argument("--speed", type=float, default=0.6)
 parser.add_argument("--warmup_updates", type=int, default=120)
 parser.add_argument("--expected_sha256", default=None)
@@ -47,6 +47,7 @@ from flightlxx_isaaclab.real_flight_replay import (  # noqa: E402
     reset_replay_control_state,
     verify_checkpoint,
 )
+from flightlxx_isaaclab.core.math import quat_error, quat_rotate_inverse  # noqa: E402
 from flightlxx_isaaclab.visual_playback import configure_visual_scene, transform_body_points  # noqa: E402
 import isaaclab.sim as sim_utils  # noqa: E402
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg  # noqa: E402
@@ -196,10 +197,12 @@ def no_impact_protocol(duration_s: float) -> FixedImpactProtocol:
 
 def scalar_metrics(raw_env):
     metrics = raw_env.evaluation_step_metrics()
-    return {
+    result = {
         key: float(metrics[key][0].detach().item())
         for key in ("position_error", "attitude_error_rad", "angular_speed", "linear_speed")
     }
+    result["failure"] = bool(metrics["failure"][0].detach().item())
+    return result
 
 
 def set_initial_state(raw_env, scenario):
@@ -207,10 +210,21 @@ def set_initial_state(raw_env, scenario):
     env_ids = torch.tensor([0], device=device, dtype=torch.long)
     angles = torch.deg2rad(torch.tensor([scenario.initial_euler_xyz_deg], device=device))
     quaternion = quat_from_euler_xyz(angles[:, 0], angles[:, 1], angles[:, 2])
-    yaw = torch.zeros_like(angles)
-    yaw[:, 2] = angles[:, 2]
-    raw_env._target_quat[env_ids] = quat_from_euler_xyz(yaw[:, 0], yaw[:, 1], yaw[:, 2])
-    pose = torch.cat((raw_env._target_position[env_ids].clone(), quaternion), dim=-1)
+    target_angles = torch.deg2rad(
+        torch.tensor([scenario.target_euler_xyz_deg], device=device)
+    )
+    target_quaternion = quat_from_euler_xyz(
+        target_angles[:, 0], target_angles[:, 1], target_angles[:, 2]
+    )
+    target_position = raw_env.scene.env_origins[env_ids] + torch.tensor(
+        [scenario.target_position_vicon_m], device=device
+    )
+    initial_position = raw_env.scene.env_origins[env_ids] + torch.tensor(
+        [scenario.initial_position_vicon_m], device=device
+    )
+    raw_env._target_position[env_ids] = target_position
+    raw_env._target_quat[env_ids] = target_quaternion
+    pose = torch.cat((initial_position, quaternion), dim=-1)
     body_rate = torch.tensor([scenario.initial_body_rate], device=device)
     angular_velocity_w = quat_apply(quaternion, body_rate)
     linear_velocity_w = torch.tensor([scenario.initial_linear_velocity_w], device=device)
@@ -220,9 +234,24 @@ def set_initial_state(raw_env, scenario):
     raw_env._actions[env_ids] = 0.0
     raw_env._previous_actions[env_ids] = 0.0
     reset_replay_control_state(raw_env, env_ids)
-    initial_feature = torch.cat((raw_env._current_state(noisy=False)[env_ids], raw_env._actions[env_ids]), dim=-1)
+    # The first inference must see the measured handoff velocity/rate instead
+    # of the hover sample that DirectRLEnv wrote during reset.  Subsequent
+    # observations again come from the normal virtual-Vicon path.
+    raw_env._vicon.reset()
+    initial_state = torch.cat(
+        (
+            quat_rotate_inverse(quaternion, initial_position - target_position),
+            quat_rotate_inverse(quaternion, linear_velocity_w),
+            quat_error(target_quaternion, quaternion),
+            body_rate,
+        ),
+        dim=-1,
+    )
+    initial_feature = torch.cat((initial_state, raw_env._actions[env_ids]), dim=-1)
     raw_env._history.reset(env_ids, initial_feature)
-    return raw_env._get_observations()["policy"]
+    fast = raw_env._history.latest(raw_env.cfg.fast_history).flatten(1)
+    slow = raw_env._history.buffer.flatten(1)
+    return torch.cat((initial_state, fast, slow), dim=-1)
 
 
 def main():
@@ -256,7 +285,7 @@ def main():
             observations = set_initial_state(raw_env, scenario)
             delay = ObservationDelay(scenario.observation_delay_steps)
             delayed_observations = delay.reset(observations)
-            metrics = ReplayMetrics()
+            metrics = ReplayMetrics(step_dt=raw_env.step_dt)
             if visuals is not None:
                 timeline.play()
                 visuals.reset()

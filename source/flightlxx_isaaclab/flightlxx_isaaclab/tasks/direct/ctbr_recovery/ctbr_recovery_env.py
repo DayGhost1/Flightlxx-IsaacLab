@@ -23,17 +23,13 @@ from flightlxx_isaaclab.core import (
     BetaflightProfile,
     SnowyOwl3PlatformCfg,
     DomainRandomizationCfg,
-    ImpactCurriculum,
-    ImpactCurriculumCfg,
-    TwoStageCurriculum,
+    ContinuousRecoveryCurriculum,
     ImpactSamplingCfg,
-    HoverRewardCfg,
-    RecoveryCriteria,
+    RecoveryRewardCfg,
     VectorizedHistory,
     fixed_target_hover_state,
     arena_failure_mask,
     classify_impact_phase,
-    physical_impact_metadata,
     quat_error,
     quat_mul,
     physx_angular_velocity_limit_deg_s,
@@ -41,8 +37,8 @@ from flightlxx_isaaclab.core import (
     sample_handoff_state,
     VirtualViconBridge,
     sample_impact_wrench,
-    unified_hover_reward,
-    update_recovery_dwell,
+    recovery_reward,
+    recovery_state_cost,
     write_com_offsets,
 )
 from flightlxx_isaaclab.core.math import quat_rotate_inverse
@@ -57,8 +53,9 @@ from flightlxx_isaaclab.evaluation import (
 STATE_DIM = 13
 ACTION_DIM = 4
 FEATURE_DIM = STATE_DIM + ACTION_DIM
-# mass, inertia, CoM, current impact wrench, thrust/tau/delay, difficulty/time/active
-PRIVILEGED_DIM = 19
+# mass, inertia, CoM, current impact wrench, thrust/tau/delay, B level,
+# elapsed/active, and the independently randomized Vicon measurement age.
+PRIVILEGED_DIM = 20
 
 
 @configclass
@@ -121,19 +118,8 @@ class CTBRRecoveryEnvCfg(DirectRLEnvCfg):
     arena_wall_thickness_m = 0.10
     body_boundary_margin_m = 0.125
     failure_penalty = -5.0
-    curriculum_recovery_position_error_m = 0.15
-    curriculum_recovery_linear_speed_mps = 0.15
-    curriculum_recovery_attitude_error_rad = 0.0872664626
-    curriculum_recovery_angular_speed_rps = 0.25
-    curriculum_recovery_dwell_s = 0.5
-    precision_recovery_position_error_m = 0.05
-    precision_recovery_linear_speed_mps = 0.05
-    precision_recovery_attitude_error_rad = 0.0349065850
-    precision_recovery_angular_speed_rps = 0.05
-    precision_recovery_dwell_s = 2.0
     enable_domain_randomization = True
     enable_impacts = True
-    curriculum_initial_difficulty = 0.05
 
 
 PREFLIGHT_COLLISION_ASSET = (
@@ -213,6 +199,7 @@ class CTBRRecoveryEnv(DirectRLEnv):
             self.device,
             output_hz=self._platform.vicon.output_hz,
             angular_window_s=self._platform.vicon.angular_window_s,
+            max_angular_dt_s=self._platform.vicon.max_angular_dt_s,
             measurement_delay_s=self._platform.vicon.measurement_age_s,
         )
         self._vicon_time_s = 0.0
@@ -232,50 +219,31 @@ class CTBRRecoveryEnv(DirectRLEnv):
         self._new_rc_frame_pending = False
         self._disturbance_force = torch.zeros_like(self._thrust)
         self._disturbance_torque = torch.zeros_like(self._thrust)
-        self._scheduled_force = torch.zeros_like(self._thrust)
-        self._scheduled_torque = torch.zeros_like(self._thrust)
-        self._application_point = torch.zeros(self.num_envs, 3, device=self.device)
-        self._disturbance_start = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self._scheduled_force = torch.zeros(self.num_envs, 3, device=self.device)
+        self._scheduled_torque = torch.zeros_like(self._scheduled_force)
+        self._application_point = torch.zeros_like(self._scheduled_force)
+        self._disturbance_start = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
         self._disturbance_end = torch.zeros_like(self._disturbance_start)
         self._disturbance_elapsed = torch.zeros(self.num_envs, device=self.device)
         self._impact_enabled = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._impact_happened = torch.zeros_like(self._impact_enabled)
-        self._impact_band = torch.zeros(self.num_envs, device=self.device, dtype=torch.uint8)
-        self._episode_difficulty = torch.zeros(self.num_envs, device=self.device)
-        self._curriculum_recovery_dwell = torch.zeros(self.num_envs, device=self.device)
-        self._precision_recovery_dwell = torch.zeros(self.num_envs, device=self.device)
-        self._curriculum_recovery_criteria = RecoveryCriteria(
-            cfg.curriculum_recovery_position_error_m,
-            cfg.curriculum_recovery_linear_speed_mps,
-            cfg.curriculum_recovery_attitude_error_rad,
-            cfg.curriculum_recovery_angular_speed_rps,
-            cfg.curriculum_recovery_dwell_s,
-        )
-        self._precision_recovery_criteria = RecoveryCriteria(
-            cfg.precision_recovery_position_error_m,
-            cfg.precision_recovery_linear_speed_mps,
-            cfg.precision_recovery_attitude_error_rad,
-            cfg.precision_recovery_angular_speed_rps,
-            cfg.precision_recovery_dwell_s,
-        )
-        self._steady_position_sum = torch.zeros(self.num_envs, device=self.device)
-        self._steady_position_count = torch.zeros(self.num_envs, device=self.device)
-        self._hover_reward_cfg = HoverRewardCfg()
+        self._difficulty = torch.zeros(self.num_envs, device=self.device)
+        self._scenario_type = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self._impact_difficulty = torch.zeros(self.num_envs, device=self.device)
+        self._hover_anchor = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._mix_kind = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self._impact_peak_cost = torch.zeros(self.num_envs, device=self.device)
+        self._tail_state_cost_sum = torch.zeros(self.num_envs, device=self.device)
+        self._tail_state_cost_count = torch.zeros(self.num_envs, device=self.device)
+        self._reward_cfg = RecoveryRewardCfg()
         self._reward_component_sums = {
             name: torch.zeros(self.num_envs, device=self.device)
             for name in (
-                "position",
-                "linear_velocity",
-                "attitude",
-                "angular_velocity",
-                "action_magnitude",
-                "action_rate",
-                "motor_saturation",
+                "state_cost",
+                "action_delta",
                 "failure",
-                "loose_recovery",
-                "precision_recovery",
-                "recovery_completion",
-                "timeout_without_recovery",
             )
         }
 
@@ -288,10 +256,13 @@ class CTBRRecoveryEnv(DirectRLEnv):
         self._target_quat = torch.zeros(self.num_envs, 4, device=self.device)
         self._target_quat[:, 0] = 1.0
         self._domain = sample_domain_parameters(self.num_envs, self.device, cfg.mass, cfg.inertia, self._domain_cfg)
-        self._curriculum = ImpactCurriculum(
-            ImpactCurriculumCfg(), initial_difficulty=cfg.curriculum_initial_difficulty
+        self._curriculum = ContinuousRecoveryCurriculum(seed=0)
+        self._curriculum_evaluation_active = False
+        self._curriculum_exam_seed = 0
+        self._curriculum_exam_group: dict[str, torch.Tensor] = {}
+        self._curriculum_exam_group_id = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
         )
-        self._stage_curriculum = TwoStageCurriculum(initial_difficulty=cfg.curriculum_initial_difficulty)
         self._impact_cfg = ImpactSamplingCfg()
         self._evaluation_state = EvaluationModeState()
         self._evaluation_protocol: FixedImpactProtocol | None = None
@@ -303,10 +274,7 @@ class CTBRRecoveryEnv(DirectRLEnv):
                 "max_position_error",
                 "max_attitude_error_rad",
                 "max_angular_velocity",
-                "recovery_time",
-                "success_recovery",
-                "precision_recovery_time",
-                "precision_recovery_success",
+                "tail_state_cost",
             )
         }
         all_ids = torch.arange(self.num_envs, device=self.device)
@@ -350,10 +318,23 @@ class CTBRRecoveryEnv(DirectRLEnv):
             # therefore cannot be used as the regex source path.
             spawn_cfg.func(f"/World/envs/env_.*/Arena_{name}", spawn_cfg, translation=translation)
 
-    def _apply_domain_randomization(self, env_ids: torch.Tensor, *, nominal: bool = False):
+    def _apply_domain_randomization(
+        self,
+        env_ids: torch.Tensor,
+        *,
+        nominal: bool = False,
+        seed: int | None = None,
+    ):
         count = len(env_ids)
         if self.cfg.enable_domain_randomization and not nominal:
-            sampled = sample_domain_parameters(count, self.device, self.cfg.mass, self.cfg.inertia, self._domain_cfg)
+            sampled = sample_domain_parameters(
+                count,
+                self.device,
+                self.cfg.mass,
+                self.cfg.inertia,
+                self._domain_cfg,
+                seed=seed,
+            )
         else:
             nominal_cfg = DomainRandomizationCfg(
                 mass_scale=(1.0, 1.0),
@@ -369,6 +350,15 @@ class CTBRRecoveryEnv(DirectRLEnv):
                 action_delay_steps=(0, 0),
                 battery_voltage_v=(16.0, 16.0),
                 battery_internal_resistance_ohm=(0.035, 0.035),
+                position_noise_std_m=(0.0, 0.0),
+                velocity_noise_std_mps=(0.0, 0.0),
+                attitude_noise_std_rad=(0.0, 0.0),
+                gyro_noise_std_radps=(0.0, 0.0),
+                gyro_bias_radps=(0.0, 0.0),
+                vicon_measurement_age_s=(
+                    self._platform.vicon.measurement_age_s,
+                    self._platform.vicon.measurement_age_s,
+                ),
                 vicon_dropout_probability=(0.0, 0.0),
             )
             sampled = sample_domain_parameters(count, self.device, self.cfg.mass, self.cfg.inertia, nominal_cfg)
@@ -411,6 +401,7 @@ class CTBRRecoveryEnv(DirectRLEnv):
             angular_velocity_noise_std_radps=self._domain.gyro_noise_std,
             angular_velocity_bias_radps=self._domain.gyro_bias,
         )
+        self._vicon.set_measurement_age(self._domain.vicon_measurement_age_s)
         self._vicon.set_dropout_probability(self._domain.vicon_dropout_probability)
 
     def _pre_physics_step(self, actions: torch.Tensor):
@@ -453,6 +444,7 @@ class CTBRRecoveryEnv(DirectRLEnv):
             self._vicon.push(
                 self._robot.data.root_pos_w,
                 self._robot.data.root_quat_w,
+                linear_velocity_w=self._robot.data.root_lin_vel_w,
                 timestamp_s=self._vicon_time_s,
             )
         self._robot.set_external_force_and_torque(
@@ -467,9 +459,13 @@ class CTBRRecoveryEnv(DirectRLEnv):
             position_error_b = quat_rotate_inverse(
                 measured[:, 6:10], measured[:, :3] - self._target_position
             )
+            # Bridge twist is world-frame, matching VRPN + the Jetson 60 ms
+            # quaternion estimator.  Rotate both vectors into the body frame
+            # the same way ``fasttd3_real.py`` does on the aircraft.
             linear_velocity_b = quat_rotate_inverse(measured[:, 6:10], measured[:, 3:6])
+            angular_velocity_b = quat_rotate_inverse(measured[:, 6:10], measured[:, 10:13])
             error_quat = quat_error(self._target_quat, measured[:, 6:10])
-            return torch.cat((position_error_b, linear_velocity_b, error_quat, measured[:, 10:13]), dim=-1)
+            return torch.cat((position_error_b, linear_velocity_b, error_quat, angular_velocity_b), dim=-1)
         position_error_b = quat_rotate_inverse(
             self._robot.data.root_quat_w, self._robot.data.root_pos_w - self._target_position
         )
@@ -506,31 +502,25 @@ class CTBRRecoveryEnv(DirectRLEnv):
                 self._domain.thrust_scale[:, None],
                 self._domain.actuator_tau[:, None],
                 self._domain.delay_steps[:, None].float(),
-                self._episode_difficulty[:, None],
+                self._impact_difficulty[:, None],
                 self._disturbance_elapsed[:, None],
                 active[:, None].float(),
+                self._domain.vicon_measurement_age_s[:, None],
             ),
             dim=-1,
         )
-        event_type, effective_band, impact_phase = physical_impact_metadata(
-            impact_enabled=self._impact_enabled,
-            impact_happened=self._impact_happened,
-            curriculum_band=self._impact_band,
-            episode_step=self.episode_length_buf,
-            disturbance_start=self._disturbance_start,
-            disturbance_end=self._disturbance_end,
+        physical_impact = self._impact_enabled & self._impact_happened
+        impact_phase = classify_impact_phase(
+            self._impact_enabled,
+            self.episode_length_buf,
+            self._disturbance_start,
+            self._disturbance_end,
             recovery_window_steps=max(1, int(round(2.0 / self.step_dt))),
         )
-        self.extras["event_type"] = event_type
-        self.extras["curriculum_band"] = effective_band
+        self.extras["event_type"] = physical_impact.to(torch.uint8)
+        self.extras["difficulty"] = self._difficulty.clone()
+        self.extras["scenario_type"] = self._scenario_type.clone()
         self.extras["impact_phase"] = impact_phase
-        self.extras["episode_difficulty"] = self._episode_difficulty.clone()
-        self.extras["initial_difficulty"] = torch.full_like(
-            self._episode_difficulty, self._stage_curriculum.initial_difficulty
-        )
-        self.extras["disturbance_difficulty"] = torch.full_like(
-            self._episode_difficulty, self._stage_curriculum.disturbance_difficulty
-        )
         actuator_diagnostics = self._actuator.diagnostics(copy=False)
         self.extras["motor_saturation_fraction"] = (
             actuator_diagnostics["motor_rpm"]
@@ -545,6 +535,7 @@ class CTBRRecoveryEnv(DirectRLEnv):
                 self._domain.actuator_tau,
                 self._domain.position_noise_std,
                 self._domain.attitude_noise_std,
+                self._domain.vicon_measurement_age_s,
                 self._domain.vicon_dropout_probability,
             ),
             dim=-1,
@@ -569,47 +560,8 @@ class CTBRRecoveryEnv(DirectRLEnv):
             torch.sum(self._target_quat * self._robot.data.root_quat_w, dim=-1).abs().clamp(max=1.0)
         )
         angular_speed = torch.linalg.vector_norm(self._robot.data.root_ang_vel_b, dim=-1)
-        disturbance_finished = ~self._impact_enabled | (self.episode_length_buf >= self._disturbance_end)
-        # Clean-hover episodes must be able to satisfy the no-impact mastery
-        # gate.  Impact episodes only become eligible after their pulse.
-        recovery_eligible = disturbance_finished & (~self._impact_enabled | self._impact_happened)
-        was_recovered = self._curriculum_recovery_dwell >= self._curriculum_recovery_criteria.dwell_s
-        self._curriculum_recovery_dwell, recovered = update_recovery_dwell(
-            self._curriculum_recovery_dwell,
-            position_error,
-            linear_speed,
-            attitude_angle,
-            angular_speed,
-            recovery_eligible,
-            self.step_dt,
-            self._curriculum_recovery_criteria,
-        )
-        self._precision_recovery_dwell, precision_recovered = update_recovery_dwell(
-            self._precision_recovery_dwell,
-            position_error,
-            linear_speed,
-            attitude_angle,
-            angular_speed,
-            recovery_eligible,
-            self.step_dt,
-            self._precision_recovery_criteria,
-        )
         failure = self._failure_mask()
-        actuator_diagnostics = self._actuator.diagnostics(copy=False)
-        motor_saturation_fraction = (
-            actuator_diagnostics["motor_rpm"]
-            >= 0.99 * actuator_diagnostics["hardware_rpm_limit"][:, None]
-        ).float().mean(dim=-1)
-        loose_inside = self._curriculum_recovery_dwell > 0.0
-        precision_inside = self._precision_recovery_dwell > 0.0
-        recovery_completed = recovered & ~was_recovered
-        timed_out_without_recovery = (
-            (self.episode_length_buf >= self.max_episode_length - 1)
-            & recovery_eligible
-            & ~recovered
-            & (self._episode_metrics["success_recovery"] == 0.0)
-        )
-        reward, reward_components = unified_hover_reward(
+        reward, reward_components = recovery_reward(
             position_error=position_error,
             linear_speed=linear_speed,
             attitude_error_rad=attitude_angle,
@@ -619,13 +571,27 @@ class CTBRRecoveryEnv(DirectRLEnv):
             failure=failure,
             step_dt=self.step_dt,
             failure_penalty=self.cfg.failure_penalty,
-            cfg=self._hover_reward_cfg,
-            motor_saturation_fraction=motor_saturation_fraction,
-            loose_inside=loose_inside,
-            precision_inside=precision_inside,
-            recovery_completed=recovery_completed,
-            timed_out_without_recovery=timed_out_without_recovery,
+            cfg=self._reward_cfg,
         )
+        state_cost = recovery_state_cost(
+            position_error=position_error,
+            linear_speed=linear_speed,
+            attitude_error_rad=attitude_angle,
+            angular_speed=angular_speed,
+            cfg=self._reward_cfg,
+        )
+        after_impact = self._impact_enabled & (
+            self.episode_length_buf >= self._disturbance_start
+        )
+        self._impact_peak_cost = torch.where(
+            after_impact,
+            torch.maximum(self._impact_peak_cost, state_cost),
+            self._impact_peak_cost,
+        )
+        tail_steps = max(1, int(round(1.0 / self.step_dt)))
+        in_tail = self.episode_length_buf >= self.max_episode_length - tail_steps
+        self._tail_state_cost_sum += torch.where(in_tail, state_cost, 0.0)
+        self._tail_state_cost_count += in_tail.float()
         for name, values in reward_components.items():
             self._reward_component_sums[name] += values
 
@@ -688,26 +654,11 @@ class CTBRRecoveryEnv(DirectRLEnv):
         self._episode_metrics["max_angular_velocity"] = torch.maximum(
             self._episode_metrics["max_angular_velocity"], angular_speed
         )
-        not_recorded = self._episode_metrics["recovery_time"] == 0.0
-        self._episode_metrics["recovery_time"] = torch.where(
-            recovered & not_recorded & self._impact_happened,
-            self._disturbance_elapsed,
-            self._episode_metrics["recovery_time"],
+        self._episode_metrics["tail_state_cost"] = torch.where(
+            self._tail_state_cost_count > 0.0,
+            self._tail_state_cost_sum / self._tail_state_cost_count.clamp_min(1.0),
+            torch.zeros_like(self._tail_state_cost_sum),
         )
-        self._episode_metrics["success_recovery"] = torch.maximum(
-            self._episode_metrics["success_recovery"], recovered.float()
-        )
-        precision_not_recorded = self._episode_metrics["precision_recovery_time"] == 0.0
-        self._episode_metrics["precision_recovery_time"] = torch.where(
-            precision_recovered & precision_not_recorded & self._impact_happened,
-            self._disturbance_elapsed,
-            self._episode_metrics["precision_recovery_time"],
-        )
-        self._episode_metrics["precision_recovery_success"] = torch.maximum(
-            self._episode_metrics["precision_recovery_success"], precision_recovered.float()
-        )
-        self._steady_position_sum += torch.where(precision_recovered, position_error, 0.0)
-        self._steady_position_count += precision_recovered.float()
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -722,69 +673,22 @@ class CTBRRecoveryEnv(DirectRLEnv):
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
-        if hasattr(self, "_episode_metrics") and not self._evaluation_state.active and not self._discard_evaluation_episode:
+        if (
+            hasattr(self, "_episode_metrics")
+            and not self._evaluation_state.active
+            and not self._curriculum_evaluation_active
+            and not self._discard_evaluation_episode
+        ):
             crashed = self.reset_terminated[env_ids].bool()
-            counted_impact = self._impact_enabled[env_ids] & self._impact_happened[env_ids]
-            curriculum_band = torch.where(
-                counted_impact,
-                self._impact_band[env_ids],
-                torch.zeros_like(self._impact_band[env_ids]),
-            )
-            stage_before = self._stage_curriculum.sample()
-            stage_after = self._stage_curriculum.record_window(
-                success_rate=self._episode_metrics["success_recovery"][env_ids].float().mean().item(),
-                crash_rate=crashed.float().mean().item(),
-                global_step=int(getattr(self, "common_step_counter", 0)),
-            )
-            stage_updated = stage_after != stage_before
-            curriculum_updated = self._curriculum.record_batch(
-                self._episode_metrics["success_recovery"][env_ids].bool(),
-                crashed,
-                curriculum_band,
-                global_step=int(getattr(self, "common_step_counter", 0)),
-            )
             self.extras["log"] = {
                 f"Metrics/{name}": values[env_ids].mean().item() for name, values in self._episode_metrics.items()
             }
-            steady_error = self._steady_position_sum[env_ids] / self._steady_position_count[env_ids].clamp_min(1.0)
-            self.extras["log"]["Metrics/steady_position_error"] = steady_error.mean().item()
-            impacted_count = counted_impact.float().sum().clamp_min(1.0)
-            self.extras["log"]["Metrics/success_recovery"] = (
-                self._episode_metrics["success_recovery"][env_ids] * counted_impact
-            ).sum().div(impacted_count).item()
-            self.extras["log"]["Metrics/precision_recovery_success"] = (
-                self._episode_metrics["precision_recovery_success"][env_ids] * counted_impact
-            ).sum().div(impacted_count).item()
             self.extras["log"]["Metrics/post_impact_crash_rate"] = (
-                crashed & counted_impact
-            ).float().sum().div(impacted_count).item()
-            self.extras["log"]["Curriculum/difficulty"] = self._curriculum.difficulty
-            self.extras["log"]["Curriculum/mastered_difficulty"] = self._curriculum.mastered_difficulty
-            self.extras["log"]["Curriculum/promotion_count"] = self._curriculum.promotion_count
-            self.extras["log"]["Curriculum/demotion_count"] = self._curriculum.demotion_count
-            self.extras["log"]["Curriculum/promotion_streak"] = self._curriculum.promotion_streak
-            self.extras["log"]["Curriculum/demotion_streak"] = self._curriculum.demotion_streak
-            self.extras["log"]["Curriculum/no_impact_success_rate"] = (
-                self._curriculum.last_no_impact_success_rate
-            )
-            self.extras["log"]["Curriculum/no_impact_crash_rate"] = (
-                self._curriculum.last_no_impact_crash_rate
-            )
-            self.extras["log"]["Curriculum/current_success_rate"] = self._curriculum.last_current_success_rate
-            self.extras["log"]["Curriculum/current_crash_rate"] = self._curriculum.last_current_crash_rate
-            self.extras["log"]["Curriculum/probe_success_rate"] = self._curriculum.last_probe_success_rate
-            self.extras["log"]["Curriculum/probe_crash_rate"] = self._curriculum.last_probe_crash_rate
-            self.extras["log"]["Curriculum/last_action"] = float(
-                {"demote": -1, "none": 0, "legacy_reset": 0, "promote": 1}.get(
-                    self._curriculum.last_action,
-                    0,
-                )
-            )
-            self.extras["log"]["Curriculum/updated"] = float(curriculum_updated)
-            self.extras["log"]["Curriculum/stage_updated"] = float(stage_updated)
-            self.extras["log"]["Curriculum/initial_difficulty"] = self._stage_curriculum.initial_difficulty
-            self.extras["log"]["Curriculum/disturbance_difficulty"] = self._stage_curriculum.disturbance_difficulty
-            self.extras["log"]["Curriculum/impact_probability"] = self._stage_curriculum.impact_probability
+                crashed & self._impact_enabled[env_ids]
+            ).float().mean().item()
+            for name, value in self._curriculum.status_diagnostics().items():
+                self.extras["log"][f"Curriculum/{name}"] = float(value)
+            self.extras["log"].update(self.live_curriculum_logs())
             episode_steps = self.episode_length_buf[env_ids].float().clamp_min(1.0)
             for name, values in self._reward_component_sums.items():
                 self.extras["log"][f"Reward/{name}"] = (
@@ -793,57 +697,107 @@ class CTBRRecoveryEnv(DirectRLEnv):
                 values[env_ids] = 0.0
             for values in self._episode_metrics.values():
                 values[env_ids] = 0.0
-            self._steady_position_sum[env_ids] = 0.0
-            self._steady_position_count[env_ids] = 0.0
+            self._tail_state_cost_sum[env_ids] = 0.0
+            self._tail_state_cost_count[env_ids] = 0.0
 
         self._robot.reset(env_ids)
         self._vicon.reset(env_ids)
         self._ball.reset(env_ids)
         super()._reset_idx(env_ids)
-        self._apply_domain_randomization(env_ids, nominal=self._evaluation_state.active)
+        exam_seed = (
+            self._curriculum_exam_seed
+            if self._curriculum_evaluation_active
+            else None
+        )
+        self._apply_domain_randomization(
+            env_ids,
+            nominal=self._evaluation_protocol is not None,
+            seed=None if exam_seed is None else exam_seed + 100,
+        )
         count = len(env_ids)
-        if self._evaluation_protocol is None:
+        if self._curriculum_evaluation_active:
+            if not self._curriculum_exam_group:
+                curriculum_sample, self._curriculum_exam_group = self._curriculum.sample_exam(
+                    count, self.device, seed=exam_seed
+                )
+                for group_id, name in enumerate(
+                    ("hover", "handoff", "impact", "handoff_impact")
+                ):
+                    self._curriculum_exam_group_id[env_ids[self._curriculum_exam_group[name]]] = group_id
+            else:
+                group_id = self._curriculum_exam_group_id[env_ids]
+                difficulty = torch.full(
+                    (count,), self._curriculum.difficulty, device=self.device
+                )
+                hover = group_id == 0
+                difficulty[hover] = 0.0
+                scenario_type = torch.zeros(count, device=self.device, dtype=torch.long)
+                scenario_type[group_id == 2] = 1
+                scenario_type[group_id == 3] = 2
+                curriculum_sample = self._curriculum.parameters(
+                    difficulty, scenario_type, hover_anchor=hover
+                )
+            self._difficulty[env_ids] = curriculum_sample.difficulty
+            self._scenario_type[env_ids] = curriculum_sample.scenario_type
+            self._mix_kind[env_ids] = curriculum_sample.mix_kind
+            handoff_difficulty = curriculum_sample.handoff_difficulty
+            self._impact_difficulty[env_ids] = curriculum_sample.impact_difficulty
+            self._impact_enabled[env_ids] = curriculum_sample.impact_enabled & self.cfg.enable_impacts
+            hover_anchor = curriculum_sample.hover_anchor
+        elif self._evaluation_protocol is None:
             curriculum_sample = self._curriculum.sample(count, self.device)
-            stage = self._stage_curriculum.sample()
-            normalized = curriculum_sample.difficulty / max(self._curriculum.difficulty, 1.0e-6)
-            handoff_difficulty = (normalized * stage.initial_difficulty).clamp(0.0, 1.0)
-            self._impact_enabled[env_ids] = (
-                curriculum_sample.impacted
-                & self.cfg.enable_impacts
-                & (stage.disturbance_difficulty > 0.0)
-                & (torch.rand(count, device=self.device) < stage.impact_probability)
-            )
-            self._episode_difficulty[env_ids] = (
-                normalized * stage.disturbance_difficulty
-            ).clamp(0.0, 1.0)
-            self._impact_band[env_ids] = curriculum_sample.band
+            self._difficulty[env_ids] = curriculum_sample.difficulty
+            self._scenario_type[env_ids] = curriculum_sample.scenario_type
+            self._mix_kind[env_ids] = curriculum_sample.mix_kind
+            handoff_difficulty = curriculum_sample.handoff_difficulty
+            self._impact_difficulty[env_ids] = curriculum_sample.impact_difficulty
+            self._impact_enabled[env_ids] = curriculum_sample.impact_enabled & self.cfg.enable_impacts
+            hover_anchor = curriculum_sample.hover_anchor
         else:
-            self._impact_enabled[env_ids] = True
-            self._episode_difficulty[env_ids] = 0.0
-            self._impact_band[env_ids] = 0
+            self._difficulty[env_ids] = 0.0
+            self._scenario_type[env_ids] = 0
+            self._impact_difficulty[env_ids] = 0.0
+            self._impact_enabled[env_ids] = any(
+                bool(torch.linalg.vector_norm(impact.force_b).item() > 0.0)
+                for impact in self._evaluation_protocol.impacts
+            )
+            self._mix_kind[env_ids] = 0
+            handoff_difficulty = torch.zeros(count, device=self.device)
+            hover_anchor = torch.zeros(count, device=self.device, dtype=torch.bool)
 
-        difficulty = handoff_difficulty if self._evaluation_protocol is None else self._episode_difficulty[env_ids]
-        impact = self._impact_enabled[env_ids]
         pose = self._robot.data.default_root_state[env_ids, :7].clone()
-        handoff = sample_handoff_state(count, self.device, difficulty=difficulty)
+        handoff = sample_handoff_state(
+            count,
+            self.device,
+            difficulty=handoff_difficulty,
+            seed=None if exam_seed is None else exam_seed + 200,
+        )
         pose[:, :3] = self._target_position[env_ids] + handoff.position_error_m
         pose[:, 3:7] = handoff.orientation_wxyz
         velocity = torch.cat((handoff.linear_velocity_mps, handoff.angular_velocity_radps), dim=-1)
-        if self._evaluation_state.active:
+        if self._evaluation_protocol is not None:
             pose, velocity = fixed_target_hover_state(
                 self._robot.data.default_root_state[env_ids],
                 self._target_position[env_ids],
                 self._target_quat[env_ids],
             )
+        elif bool(torch.any(hover_anchor)):
+            pose[hover_anchor, :3] = self._target_position[env_ids][hover_anchor]
+            pose[hover_anchor, 3:7] = self._target_quat[env_ids][hover_anchor]
+            velocity[hover_anchor] = 0.0
+        self._hover_anchor[env_ids] = hover_anchor
         self._robot.write_root_pose_to_sim(pose, env_ids)
         self._robot.write_root_velocity_to_sim(velocity, env_ids)
         bootstrap_position = self._robot.data.root_pos_w.clone()
         bootstrap_quaternion = self._robot.data.root_quat_w.clone()
+        bootstrap_linear_velocity = self._robot.data.root_lin_vel_w.clone()
         bootstrap_position[env_ids] = pose[:, :3]
         bootstrap_quaternion[env_ids] = pose[:, 3:7]
+        bootstrap_linear_velocity[env_ids] = velocity[:, :3]
         self._vicon.push(
             bootstrap_position,
             bootstrap_quaternion,
+            linear_velocity_w=bootstrap_linear_velocity,
             # ``measurement_delay_s`` is an observation-selection age, never
             # a backdated source timestamp.  Backdating here could violate the
             # Vicon bridge's monotonic timestamp contract after an env reset.
@@ -861,56 +815,71 @@ class CTBRRecoveryEnv(DirectRLEnv):
         self._action_delay.reset(env_ids)
         self._actuator.reset(env_ids)
         self._betaflight.reset(env_ids)
-        self._curriculum_recovery_dwell[env_ids] = 0.0
-        self._precision_recovery_dwell[env_ids] = 0.0
         if self._evaluation_protocol is None:
-            self._sample_disturbance(env_ids)
+            self._sample_disturbance(
+                env_ids,
+                seed=None if exam_seed is None else exam_seed + 300,
+            )
         else:
-            self._disturbance_force[env_ids] = 0.0
-            self._disturbance_torque[env_ids] = 0.0
-            self._scheduled_force[env_ids] = 0.0
-            self._scheduled_torque[env_ids] = 0.0
-            self._impact_happened[env_ids] = False
-            self._disturbance_elapsed[env_ids] = 0.0
+            self._configure_evaluation_disturbance(env_ids)
+        self._tail_state_cost_sum[env_ids] = 0.0
+        self._tail_state_cost_count[env_ids] = 0.0
+        self._impact_peak_cost[env_ids] = 0.0
         initial_feature = torch.cat((self._current_state(noisy=self._evaluation_state.noisy_observations)[env_ids], self._actions[env_ids]), dim=-1)
         self._history.reset(env_ids, initial_feature)
         self._discard_evaluation_episode = False
 
-    def _sample_disturbance(self, env_ids: torch.Tensor):
-        sample = sample_impact_wrench(
-            self._domain.mass[env_ids],
-            self._domain.inertia[env_ids],
-            self._episode_difficulty[env_ids],
-            self._impact_cfg,
-        )
-        self._disturbance_start[env_ids] = (sample.start_s / self.step_dt).round().long()
-        duration_steps = (sample.duration_s / self.step_dt).round().long().clamp_min(1)
-        self._disturbance_end[env_ids] = self._disturbance_start[env_ids] + duration_steps
+    def _sample_disturbance(
+        self, env_ids: torch.Tensor, *, seed: int | None = None
+    ):
+        count = len(env_ids)
+        self._disturbance_start[env_ids] = 0
+        self._disturbance_end[env_ids] = 0
+        self._scheduled_force[env_ids] = 0.0
+        self._scheduled_torque[env_ids] = 0.0
+        self._application_point[env_ids] = 0.0
         self._disturbance_elapsed[env_ids] = 0.0
         self._impact_happened[env_ids] = False
         self._disturbance_force[env_ids] = 0.0
         self._disturbance_torque[env_ids] = 0.0
-        self._scheduled_force[env_ids, 0] = sample.force_b
-        self._scheduled_torque[env_ids, 0] = sample.torque_b
-        self._application_point[env_ids] = sample.application_point_b
-        inactive = env_ids[~self._impact_enabled[env_ids]]
-        self._scheduled_force[inactive] = 0.0
-        self._scheduled_torque[inactive] = 0.0
+
+        sample = sample_impact_wrench(
+            self._domain.mass[env_ids],
+            self._domain.inertia[env_ids],
+            self._impact_difficulty[env_ids],
+            self._impact_cfg,
+            seed=seed,
+        )
+        start = (sample.start_s / self.step_dt).round().long()
+        duration_steps = (sample.duration_s / self.step_dt).round().long().clamp_min(1)
+        self._disturbance_start[env_ids] = start
+        self._disturbance_end[env_ids] = start + duration_steps
+        valid = self._impact_enabled[env_ids]
+        valid_ids = env_ids[valid]
+        self._scheduled_force[valid_ids] = sample.force_b[valid]
+        self._scheduled_torque[valid_ids] = sample.torque_b[valid]
+        self._application_point[valid_ids] = sample.application_point_b[valid]
+
+    def _configure_evaluation_disturbance(self, env_ids: torch.Tensor):
+        self._disturbance_start[env_ids] = 0
+        self._disturbance_end[env_ids] = 0
+        self._scheduled_force[env_ids] = 0.0
+        self._scheduled_torque[env_ids] = 0.0
+        self._application_point[env_ids] = 0.0
+        self._disturbance_force[env_ids] = 0.0
+        self._disturbance_torque[env_ids] = 0.0
+        self._impact_happened[env_ids] = False
+        self._disturbance_elapsed[env_ids] = 0.0
+        impact = self._evaluation_protocol.impacts[0]
+        start = int(round(impact.trigger_time_s / self.step_dt))
+        duration = max(1, int(round(impact.duration_s / self.step_dt)))
+        self._disturbance_start[env_ids] = start
+        self._disturbance_end[env_ids] = start + duration
+        self._scheduled_force[env_ids] = impact.force_b.to(self.device)
+        self._scheduled_torque[env_ids] = impact.equivalent_torque_b.to(self.device)
+        self._application_point[env_ids] = impact.application_point_b.to(self.device)
 
     def _update_disturbances(self):
-        if self._evaluation_protocol is not None:
-            time_s = self.episode_length_buf.float() * self.step_dt
-            self._disturbance_force.zero_()
-            self._disturbance_torque.zero_()
-            for impact in self._evaluation_protocol.impacts:
-                active = (time_s >= impact.trigger_time_s) & (time_s < impact.end_time_s)
-                self._disturbance_force[active, 0] = impact.force_b.to(self.device)
-                self._disturbance_torque[active, 0] = impact.equivalent_torque_b.to(self.device)
-            first_time = self._evaluation_protocol.impacts[0].trigger_time_s
-            happened = time_s >= first_time
-            self._impact_happened |= happened
-            self._disturbance_elapsed[happened] = time_s[happened] - first_time
-            return
         active = (
             self._impact_enabled
             & (self.episode_length_buf >= self._disturbance_start)
@@ -918,16 +887,98 @@ class CTBRRecoveryEnv(DirectRLEnv):
         )
         self._disturbance_force.zero_()
         self._disturbance_torque.zero_()
-        self._disturbance_force[active] = self._scheduled_force[active]
-        self._disturbance_torque[active] = self._scheduled_torque[active]
-        happened = self._impact_enabled & (self.episode_length_buf >= self._disturbance_start)
+        self._disturbance_force[:, 0] = self._scheduled_force * active[:, None]
+        self._disturbance_torque[:, 0] = self._scheduled_torque * active[:, None]
+        started = self.episode_length_buf >= self._disturbance_start
+        happened = self._impact_enabled & started
         self._impact_happened |= happened
-        self._disturbance_elapsed[happened] += self.step_dt
+        after_last = self._impact_enabled & (
+            self.episode_length_buf >= self._disturbance_end
+        )
+        self._disturbance_elapsed = torch.where(
+            after_last,
+            (self.episode_length_buf - self._disturbance_end).float() * self.step_dt,
+            torch.zeros_like(self._disturbance_elapsed),
+        )
+
+    def live_curriculum_logs(self) -> dict[str, float]:
+        """Per-environment mix and scenario fractions for TensorBoard."""
+
+        from flightlxx_isaaclab.core.curriculum import (
+            HANDOFF_IMPACT_SCENARIO,
+            HANDOFF_SCENARIO,
+            IMPACT_SCENARIO,
+            MIX_CURRENT,
+            MIX_HOVER,
+            MIX_PROBE,
+            MIX_REHEARSAL,
+        )
+
+        hover = self._hover_anchor
+        weights = self._curriculum.last_scenario_weights
+        return {
+            "Mix/hover_frac": (self._mix_kind == MIX_HOVER).float().mean().item(),
+            "Mix/current_frac": (self._mix_kind == MIX_CURRENT).float().mean().item(),
+            "Mix/rehearsal_frac": (self._mix_kind == MIX_REHEARSAL).float().mean().item(),
+            "Mix/probe_frac": (self._mix_kind == MIX_PROBE).float().mean().item(),
+            "Mix/scenario_handoff_frac": (
+                (~hover) & (self._scenario_type == HANDOFF_SCENARIO)
+            ).float().mean().item(),
+            "Mix/scenario_impact_frac": (
+                (~hover) & (self._scenario_type == IMPACT_SCENARIO)
+            ).float().mean().item(),
+            "Mix/scenario_handoff_impact_frac": (
+                (~hover) & (self._scenario_type == HANDOFF_IMPACT_SCENARIO)
+            ).float().mean().item(),
+            "Mix/scenario_weight_handoff": float(weights[0]),
+            "Mix/scenario_weight_impact": float(weights[1]),
+            "Mix/scenario_weight_handoff_impact": float(weights[2]),
+            "Curriculum/mean_sampled_difficulty": self._difficulty.mean().item(),
+        }
 
     def begin_fixed_evaluation(self, protocol: FixedImpactProtocol):
-        """Enable deterministic, nominal five-impact evaluation for the next reset."""
+        """Enable one deterministic impact trial for the next reset."""
         self._evaluation_protocol = protocol
         self._evaluation_state.begin_fixed_evaluation(protocol)
+
+    def initialize_curriculum(
+        self,
+        difficulty: float,
+        retention_floor: float = 0.0,
+    ) -> None:
+        """Set the starting level for a fresh scratch or pretrained run."""
+
+        self._curriculum = ContinuousRecoveryCurriculum(
+            initial_difficulty=difficulty,
+            retention_floor=retention_floor,
+            seed=self._curriculum.seed,
+        )
+
+    def begin_curriculum_evaluation(self, paper_index: int | None = None) -> int:
+        """Use the next reset for a balanced current-difficulty exam."""
+
+        self._curriculum_evaluation_active = True
+        self._curriculum_exam_seed = (
+            self._curriculum.next_exam_seed()
+            if paper_index is None
+            else self._curriculum.seed + int(paper_index)
+        )
+        # The groups are populated by the reset triggered by the caller.
+        return self._curriculum_exam_seed
+
+    def curriculum_evaluation_groups(self) -> dict[str, torch.Tensor]:
+        return self._curriculum_exam_group
+
+    def complete_curriculum_evaluation(
+        self, assessment: dict[str, dict[str, float]]
+    ) -> dict[str, float]:
+        self._curriculum.update_exam(assessment)
+        return self._curriculum.diagnostics()
+
+    def end_curriculum_evaluation(self) -> None:
+        self._curriculum_evaluation_active = False
+        self._curriculum_exam_group = {}
+        self._discard_evaluation_episode = True
 
     @property
     def evaluation_finished(self) -> bool:
@@ -1026,22 +1077,14 @@ class CTBRRecoveryEnv(DirectRLEnv):
         }
 
     def get_training_state(self) -> dict:
-        return {
-            "curriculum": self._curriculum.state_dict(),
-            "stage_curriculum": {
-                "initial_difficulty": self._stage_curriculum.initial_difficulty,
-                "disturbance_difficulty": self._stage_curriculum.disturbance_difficulty,
-                "impact_probability": self._stage_curriculum.impact_probability,
-            },
-        }
+        return {"curriculum": self._curriculum.state_dict()}
+
+    def set_training_discount(self, gamma: float) -> None:
+        """Validate the learner discount; the dense state cost has no shaping term."""
+
+        if not 0.0 < gamma <= 1.0:
+            raise ValueError("training discount gamma must lie in (0, 1]")
 
     def load_training_state(self, state: dict) -> None:
         if state and "curriculum" in state:
             self._curriculum.load_state_dict(state["curriculum"])
-        if state and "stage_curriculum" in state:
-            stage = state["stage_curriculum"]
-            self._stage_curriculum.initial_difficulty = float(stage["initial_difficulty"])
-            self._stage_curriculum.disturbance_difficulty = float(stage["disturbance_difficulty"])
-            self._stage_curriculum.impact_probability = float(
-                stage.get("impact_probability", self._stage_curriculum.impact_probability)
-            )

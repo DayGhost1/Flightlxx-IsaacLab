@@ -48,7 +48,6 @@ def main() -> None:
     from fixed_impact_evaluation import evaluate_fixed_five_impacts
     from flightlxx_isaaclab.evaluation import load_fixed_protocol, protocol_for_impact_level
     from flightlxx_isaaclab.fast_td3_models import HistoryActor, POLICY_RAW_DIM
-    from flightlxx_isaaclab.visual_report import write_visual_evaluation_report
     from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
     class DirectGymPolicyAdapter:
@@ -105,19 +104,6 @@ def main() -> None:
         protocol=protocol,
     )
     result["checkpoint_step"] = checkpoint_step
-    independent = result["modes"]["independent"]
-    sequential = result["modes"]["sequential"]
-    report_paths = None
-    report_warning = None
-    try:
-        report_paths = write_visual_evaluation_report(result, protocol, args.output_dir)
-    except ValueError as exc:
-        if "does not contain telemetry in the five impact windows" not in str(exc):
-            raise
-        # A policy can fail before the first scheduled impact.  The JSON and
-        # full time-series are still valid artifacts; there is simply no
-        # impact-aligned window from which to build the usual figures.
-        report_warning = str(exc)
     summary = {
         "stage": "completed",
         "pass": True,
@@ -126,12 +112,6 @@ def main() -> None:
         "impact_level": args.impact_level,
         "force_scale": protocol.force_scale,
         "recovered_count": int(result["recovered_count"]),
-        "independent_passed": bool(independent["passed"]),
-        "independent_recovered_count": int(independent["recovered_count"]),
-        "independent_crashed": bool(independent["crashed"]),
-        "sequential_passed": bool(sequential["passed"]),
-        "sequential_recovered_count": int(sequential["recovered_count"]),
-        "sequential_crashed": bool(sequential["crashed"]),
         "crashed": bool(result["crashed"]),
         "max_position_error": float(result["max_position_error"]),
         "max_attitude_error_rad": float(result["max_attitude_error_rad"]),
@@ -139,9 +119,9 @@ def main() -> None:
         "max_angular_speed": float(result["max_angular_speed"]),
         "evaluation_json": str(result["json_path"]),
         "timeseries_csv": str(result["timeseries_path"]),
-        "response_figure": None if report_paths is None else str(report_paths.response_figure),
-        "report": None if report_paths is None else str(report_paths.markdown),
-        "report_warning": report_warning,
+        "response_figure": None,
+        "report": None,
+        "report_warning": None,
     }
     write_runner_result(summary)
     safe_print(summary)

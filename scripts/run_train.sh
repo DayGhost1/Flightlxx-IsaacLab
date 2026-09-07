@@ -25,11 +25,6 @@ fi
 # SAVE_INTERVAL   : checkpoint 间隔；保存后训练器会自动跑固定五冲击评测。
 # LOG_INTERVAL    : TensorBoard/CSV/终端日志间隔。
 # LEARNING_STARTS : 开始梯度更新前先收集多少个 global steps。
-# REPLAY_BAND_FRACTIONS : 每批无撞击/简单/中间/当前/探测层比例；五项与失败上下文之和为 1。
-# FAILURE_CONTEXT_FRACTION: 失败发生前因果片段的独立采样比例。
-# FAILURE_CONTEXT_STEPS   : 每次失败最多向前标记的控制步数（默认 50，即 1 s）。
-# ACTIVE_IMPACT_FRACTION: 每个 batch 中正在受力的稀有 transition 目标比例。
-# RECOVERY_PHASE_FRACTION: 每个 batch 中撞击后前 2 s 恢复 transition 的目标比例。
 # OUTPUT_ROOT     : 所有时间戳 run、checkpoints、logs 和 reports 的根目录。
 #
 # 额外 FastTD3 参数可直接追加在脚本末尾，例如：
@@ -37,24 +32,13 @@ fi
 # 完整操作说明见 scripts/README_CN.md。修改这里不会改变已经运行的训练进程。
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-250000}"
 NUM_ENVS="${NUM_ENVS:-1024}"
-BUFFER_SIZE="${BUFFER_SIZE:-3072}"
+BUFFER_SIZE="${BUFFER_SIZE:-6144}"
 BATCH_SIZE="${BATCH_SIZE:-24576}"
 NUM_UPDATES="${NUM_UPDATES:-2}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-25000}"
 LOG_INTERVAL="${LOG_INTERVAL:-100}"
 LEARNING_STARTS="${LEARNING_STARTS:-10}"
-REPLAY_BAND_FRACTIONS="${REPLAY_BAND_FRACTIONS:-0.10 0.15 0.20 0.35 0.10}"
-FAILURE_CONTEXT_FRACTION="${FAILURE_CONTEXT_FRACTION:-0.10}"
-FAILURE_CONTEXT_STEPS="${FAILURE_CONTEXT_STEPS:-50}"
-ACTIVE_IMPACT_FRACTION="${ACTIVE_IMPACT_FRACTION:-0.05}"
-RECOVERY_PHASE_FRACTION="${RECOVERY_PHASE_FRACTION:-0.20}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$FLIGHTLXX_DIR/outputs/training}"
-
-read -r -a replay_band_fractions <<< "$REPLAY_BAND_FRACTIONS"
-if [[ "${#replay_band_fractions[@]}" -ne 5 ]]; then
-    echo "REPLAY_BAND_FRACTIONS 必须包含五个空格分隔的数：无撞击 简单 中间 当前 探测" >&2
-    exit 2
-fi
 
 LAUNCH_ID="$(date +%Y%m%d_%H%M%S)"
 MONITOR_DIR="$OUTPUT_ROOT/monitoring/$LAUNCH_ID"
@@ -98,8 +82,7 @@ trap cleanup EXIT INT TERM
 echo "FlightLxx FastTD3 launch: $LAUNCH_ID" | tee "$TRAIN_LOG"
 echo "platform_provenance=$PROVENANCE_ARTIFACT" | tee -a "$TRAIN_LOG"
 echo "num_envs=$NUM_ENVS buffer_size=$BUFFER_SIZE batch_size=$BATCH_SIZE num_updates=$NUM_UPDATES" | tee -a "$TRAIN_LOG"
-echo "replay_bands=$REPLAY_BAND_FRACTIONS failure_context_fraction=$FAILURE_CONTEXT_FRACTION failure_context_steps=$FAILURE_CONTEXT_STEPS" | tee -a "$TRAIN_LOG"
-echo "active_impact_fraction=$ACTIVE_IMPACT_FRACTION recovery_phase_fraction=$RECOVERY_PHASE_FRACTION" | tee -a "$TRAIN_LOG"
+echo "replay_sampling=uniform (environment owns task curriculum)" | tee -a "$TRAIN_LOG"
 echo "monitor_dir=$MONITOR_DIR" | tee -a "$TRAIN_LOG"
 
 cd "$FASTTD3_DIR/fast_td3"
@@ -112,11 +95,6 @@ cd "$FASTTD3_DIR/fast_td3"
     --batch-size "$BATCH_SIZE" \
     --num-updates "$NUM_UPDATES" \
     --learning-starts "$LEARNING_STARTS" \
-    --band-balance-fractions "${replay_band_fractions[@]}" \
-    --failure-context-fraction "$FAILURE_CONTEXT_FRACTION" \
-    --failure-context-steps "$FAILURE_CONTEXT_STEPS" \
-    --active-impact-fraction "$ACTIVE_IMPACT_FRACTION" \
-    --recovery-phase-fraction "$RECOVERY_PHASE_FRACTION" \
     --save-interval "$SAVE_INTERVAL" \
     --log-interval "$LOG_INTERVAL" \
     --output-root "$OUTPUT_ROOT" \

@@ -1,10 +1,10 @@
 diff --git a/fast_td3/environments/isaaclab_env.py b/fast_td3/environments/isaaclab_env.py
-index 2374ebc..3ca1714 100644
+index 2374ebc..87cd56c 100644
 --- a/fast_td3/environments/isaaclab_env.py
 +++ b/fast_td3/environments/isaaclab_env.py
 @@ -21,6 +21,14 @@ class IsaacLabEnv:
          simulation_app = app_launcher.app
-
+ 
          import isaaclab_tasks
 +        # Register the external FlightLxx task when its package is installed.
 +        try:
@@ -15,9 +15,9 @@ index 2374ebc..3ca1714 100644
 +                    "FlightLxx task requested but flightlxx_isaaclab is not installed"
 +                ) from exc
          from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
-
+ 
          env_cfg = parse_env_cfg(
-@@ -68,6 +76,23 @@ class IsaacLabEnv:
+@@ -68,6 +76,24 @@ class IsaacLabEnv:
          obs = obs_dict["policy"]
          critic_obs = obs_dict["critic"] if self.asymmetric_obs else None
          info_ret = {"time_outs": truncations, "observations": {"critic": critic_obs}}
@@ -27,10 +27,11 @@ index 2374ebc..3ca1714 100644
 +        for replay_key in (
 +            "event_type",
 +            "curriculum_band",
++            "curriculum_focus",
++            "a_level",
++            "b_level",
++            "c_level",
 +            "impact_phase",
-+            "episode_difficulty",
-+            "initial_difficulty",
-+            "disturbance_difficulty",
 +            "motor_saturation_fraction",
 +            "domain_parameters",
 +        ):
@@ -41,10 +42,10 @@ index 2374ebc..3ca1714 100644
          # NOTE: There's really no way to get the raw observations from IsaacLab
          # We just use the 'reset_obs' as next_obs, unfortunately.
          # See https://github.com/isaac-sim/IsaacLab/issues/1362
-@@ -77,6 +102,24 @@ class IsaacLabEnv:
+@@ -77,6 +103,29 @@ class IsaacLabEnv:
          }
          return obs, rew, dones, info_ret
-
+ 
 +    def get_training_state(self) -> dict:
 +        env = self.envs.unwrapped
 +        return env.get_training_state() if hasattr(env, "get_training_state") else {}
@@ -53,6 +54,11 @@ index 2374ebc..3ca1714 100644
 +        env = self.envs.unwrapped
 +        if hasattr(env, "load_training_state"):
 +            env.load_training_state(state)
++
++    def set_training_discount(self, gamma: float) -> None:
++        env = self.envs.unwrapped
++        if hasattr(env, "set_training_discount"):
++            env.set_training_discount(gamma)
 +
 +    def begin_fixed_evaluation(self, protocol) -> None:
 +        self.envs.unwrapped.begin_fixed_evaluation(protocol)
@@ -67,51 +73,44 @@ index 2374ebc..3ca1714 100644
          raise NotImplementedError(
              "We don't support rendering for IsaacLab environments"
 diff --git a/fast_td3/fast_td3_utils.py b/fast_td3/fast_td3_utils.py
-index 273ac0e..0326a30 100644
+index 273ac0e..4b432d8 100644
 --- a/fast_td3/fast_td3_utils.py
 +++ b/fast_td3/fast_td3_utils.py
-@@ -9,6 +9,66 @@ import torch.distributed as dist
+@@ -9,6 +9,59 @@ import torch.distributed as dist
  from tensordict import TensorDict
-
-
+ 
+ 
 +def extract_replay_metadata(infos: dict, event_type: torch.Tensor) -> dict[str, torch.Tensor]:
-+    """Return compact curriculum labels, including legacy-safe defaults."""
++    """Return compact three-axis curriculum labels with safe generic defaults."""
 +
 +    event_type = event_type.to(torch.uint8)
-+    bands = infos.get("curriculum_band", event_type * 3).to(
-+        device=event_type.device, dtype=torch.uint8
-+    )
-+    phases = infos.get("impact_phase", torch.zeros_like(event_type)).to(
-+        device=event_type.device, dtype=torch.uint8
-+    )
-+    difficulties = infos.get(
-+        "episode_difficulty",
-+        torch.zeros(event_type.shape, device=event_type.device, dtype=torch.float),
-+    ).to(device=event_type.device, dtype=torch.float)
-+    initial_difficulty = infos.get(
-+        "initial_difficulty",
-+        torch.zeros(event_type.shape, device=event_type.device, dtype=torch.float),
-+    ).to(device=event_type.device, dtype=torch.float)
-+    disturbance_difficulty = infos.get(
-+        "disturbance_difficulty",
-+        torch.zeros(event_type.shape, device=event_type.device, dtype=torch.float),
-+    ).to(device=event_type.device, dtype=torch.float)
++    zeros = torch.zeros_like(event_type)
++
++    def label(name: str) -> torch.Tensor:
++        value = infos.get(name, zeros).to(device=event_type.device, dtype=torch.uint8)
++        if value.shape != event_type.shape:
++            raise ValueError(f"{name} must have shape [num_envs]")
++        return value
++
 +    motor_saturation_fraction = infos.get(
 +        "motor_saturation_fraction",
 +        torch.zeros(event_type.shape, device=event_type.device, dtype=torch.float),
 +    ).to(device=event_type.device, dtype=torch.float)
++    if motor_saturation_fraction.shape != event_type.shape:
++        raise ValueError("motor_saturation_fraction must have shape [num_envs]")
 +    domain_parameters = infos.get(
 +        "domain_parameters",
-+        torch.zeros((event_type.numel(), 8), device=event_type.device, dtype=torch.float),
++        torch.zeros((event_type.numel(), 9), device=event_type.device, dtype=torch.float),
 +    ).to(device=event_type.device, dtype=torch.float)
-+    if domain_parameters.shape != (event_type.numel(), 8):
-+        raise ValueError("domain_parameters must have shape [num_envs, 8]")
++    if domain_parameters.shape != (event_type.numel(), 9):
++        raise ValueError("domain_parameters must have shape [num_envs, 9]")
 +    return {
-+        "curriculum_band": bands,
-+        "impact_phase": phases,
-+        "episode_difficulty": difficulties,
-+        "initial_difficulty": initial_difficulty,
-+        "disturbance_difficulty": disturbance_difficulty,
++        "curriculum_band": label("curriculum_band"),
++        "curriculum_focus": label("curriculum_focus"),
++        "a_level": label("a_level"),
++        "b_level": label("b_level"),
++        "c_level": label("c_level"),
++        "impact_phase": label("impact_phase"),
 +        "motor_saturation_fraction": motor_saturation_fraction,
 +        "domain_parameters": domain_parameters,
 +    }
@@ -129,7 +128,7 @@ index 273ac0e..0326a30 100644
 +    # Only the stratified sampler owns this aggregate.  For legacy binary replay,
 +    # train.py already logs its measured event fraction and that value must not
 +    # be overwritten by the unused four-band counters above.
-+    if getattr(replay, "band_balance_fractions", None) is not None:
++    if getattr(replay, "curriculum_mix_fractions", None) is not None:
 +        logs["replay_impact_fraction"] = float(samples.get("sample_impact", 0.0))
 +    return logs
 +
@@ -137,20 +136,17 @@ index 273ac0e..0326a30 100644
  class SimpleReplayBuffer(nn.Module):
      def __init__(
          self,
-@@ -19,6 +79,12 @@ class SimpleReplayBuffer(nn.Module):
+@@ -19,6 +72,9 @@ class SimpleReplayBuffer(nn.Module):
          n_critic_obs: int,
          asymmetric_obs: bool = False,
          playground_mode: bool = False,
 +        event_balance_fraction: Optional[float] = None,
-+        band_balance_fractions: Optional[tuple[float, float, float, float, float]] = None,
-+        failure_context_fraction: float = 0.0,
++        curriculum_mix_fractions: Optional[tuple[float, float, float]] = None,
 +        failure_context_steps: int = 50,
-+        active_impact_fraction: float = 0.0,
-+        recovery_phase_fraction: float = 0.0,
          n_steps: int = 1,
          gamma: float = 0.99,
          device=None,
-@@ -42,6 +108,38 @@ class SimpleReplayBuffer(nn.Module):
+@@ -42,6 +98,27 @@ class SimpleReplayBuffer(nn.Module):
          self.n_critic_obs = n_critic_obs
          self.asymmetric_obs = asymmetric_obs
          self.playground_mode = playground_mode and asymmetric_obs
@@ -158,38 +154,27 @@ index 273ac0e..0326a30 100644
 +        # Store the suffix for every asymmetric environment instead of duplicating policy history.
 +        self.compact_asymmetric = asymmetric_obs
 +        self.event_balance_fraction = event_balance_fraction
-+        self.band_balance_fractions = (
-+            tuple(float(value) for value in band_balance_fractions)
-+            if band_balance_fractions is not None
++        self.curriculum_mix_fractions = (
++            tuple(float(value) for value in curriculum_mix_fractions)
++            if curriculum_mix_fractions is not None
 +            else None
 +        )
-+        if self.band_balance_fractions is not None:
-+            if len(self.band_balance_fractions) != 5:
-+                raise ValueError("band_balance_fractions must contain five values")
-+            if any(value < 0.0 for value in self.band_balance_fractions):
-+                raise ValueError("band_balance_fractions must be non-negative")
-+            if abs(sum(self.band_balance_fractions) + failure_context_fraction - 1.0) > 1.0e-6:
-+                raise ValueError(
-+                    "band_balance_fractions plus failure_context_fraction must sum to one"
-+                )
++        if self.curriculum_mix_fractions is not None:
++            if len(self.curriculum_mix_fractions) != 3:
++                raise ValueError("curriculum_mix_fractions must contain three values")
++            if any(value < 0.0 for value in self.curriculum_mix_fractions):
++                raise ValueError("curriculum_mix_fractions must be non-negative")
++            if abs(sum(self.curriculum_mix_fractions) - 1.0) > 1.0e-6:
++                raise ValueError("curriculum_mix_fractions must sum to one")
 +            if n_steps != 1:
 +                raise ValueError("stratified curriculum replay currently requires n_steps=1")
-+        if not 0.0 <= failure_context_fraction <= 1.0:
-+            raise ValueError("failure_context_fraction must be between zero and one")
 +        if failure_context_steps <= 0:
 +            raise ValueError("failure_context_steps must be positive")
-+        if not 0.0 <= active_impact_fraction <= 1.0:
-+            raise ValueError("active_impact_fraction must be between zero and one")
-+        if not 0.0 <= recovery_phase_fraction <= 1.0:
-+            raise ValueError("recovery_phase_fraction must be between zero and one")
-+        self.failure_context_fraction = float(failure_context_fraction)
 +        self.failure_context_steps = int(failure_context_steps)
-+        self.active_impact_fraction = float(active_impact_fraction)
-+        self.recovery_phase_fraction = float(recovery_phase_fraction)
          self.gamma = gamma
          self.n_steps = n_steps
          self.device = device
-@@ -63,7 +161,7 @@ class SimpleReplayBuffer(nn.Module):
+@@ -63,7 +140,7 @@ class SimpleReplayBuffer(nn.Module):
              (n_env, buffer_size, n_obs), device=device, dtype=torch.float
          )
          if asymmetric_obs:
@@ -198,7 +183,7 @@ index 273ac0e..0326a30 100644
                  # Only store the privileged part of observations (n_critic_obs - n_obs)
                  self.privileged_obs_size = n_critic_obs - n_obs
                  self.privileged_observations = torch.zeros(
-@@ -85,6 +183,46 @@ class SimpleReplayBuffer(nn.Module):
+@@ -85,6 +162,38 @@ class SimpleReplayBuffer(nn.Module):
                      (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
                  )
          self.ptr = 0
@@ -208,32 +193,25 @@ index 273ac0e..0326a30 100644
 +        self.curriculum_bands = torch.zeros(
 +            (n_env, buffer_size), device=device, dtype=torch.uint8
 +        )
++        self.curriculum_focus = torch.zeros_like(self.curriculum_bands)
++        self.a_levels = torch.zeros_like(self.curriculum_bands)
++        self.b_levels = torch.zeros_like(self.curriculum_bands)
++        self.c_levels = torch.zeros_like(self.curriculum_bands)
 +        self.impact_phases = torch.zeros(
 +            (n_env, buffer_size), device=device, dtype=torch.uint8
-+        )
-+        self.episode_difficulties = torch.zeros(
-+            (n_env, buffer_size), device=device, dtype=torch.float16
-+        )
-+        self.initial_difficulties = torch.zeros(
-+            (n_env, buffer_size), device=device, dtype=torch.float16
-+        )
-+        self.disturbance_difficulties = torch.zeros(
-+            (n_env, buffer_size), device=device, dtype=torch.float16
 +        )
 +        self.motor_saturation_fractions = torch.zeros(
 +            (n_env, buffer_size), device=device, dtype=torch.float16
 +        )
 +        self.domain_parameters = torch.zeros(
-+            (n_env, buffer_size, 8), device=device, dtype=torch.float16
++            (n_env, buffer_size, 9), device=device, dtype=torch.float16
 +        )
 +        self.failure_contexts = torch.zeros(
 +            (n_env, buffer_size), device=device, dtype=torch.uint8
 +        )
 +        self.last_sample_stats: dict[str, float] = {
-+            "sample_no_impact": 0.0,
-+            "sample_easy": 0.0,
-+            "sample_middle": 0.0,
-+            "sample_current": 0.0,
++            "sample_mastered": 0.0,
++            "sample_boundary": 0.0,
 +            "sample_probe": 0.0,
 +            "sample_failure_context": 0.0,
 +            "sample_impact": 0.0,
@@ -241,11 +219,10 @@ index 273ac0e..0326a30 100644
 +            "sample_recovery_phase": 0.0,
 +            "fallback_fraction": 0.0,
 +        }
-+        self.legacy_metadata = False
-
+ 
      @torch.no_grad()
      def extend(
-@@ -104,12 +242,40 @@ class SimpleReplayBuffer(nn.Module):
+@@ -104,12 +213,41 @@ class SimpleReplayBuffer(nn.Module):
          self.rewards[:, ptr] = rewards
          self.dones[:, ptr] = dones
          self.truncations[:, ptr] = truncations
@@ -258,18 +235,19 @@ index 273ac0e..0326a30 100644
 +        if "curriculum_band" in tensor_dict.keys():
 +            self.curriculum_bands[:, ptr] = tensor_dict["curriculum_band"].to(torch.uint8)
 +        else:
-+            self.curriculum_bands[:, ptr] = self.event_types[:, ptr] * 2
++            self.curriculum_bands[:, ptr] = 0
++        for key, storage in (
++            ("curriculum_focus", self.curriculum_focus),
++            ("a_level", self.a_levels),
++            ("b_level", self.b_levels),
++            ("c_level", self.c_levels),
++        ):
++            storage[:, ptr] = tensor_dict[key].to(torch.uint8) if key in tensor_dict.keys() else 0
 +        if "impact_phase" in tensor_dict.keys():
 +            self.impact_phases[:, ptr] = tensor_dict["impact_phase"].to(torch.uint8)
 +        else:
 +            self.impact_phases[:, ptr] = 0
-+        if "episode_difficulty" in tensor_dict.keys():
-+            self.episode_difficulties[:, ptr] = tensor_dict["episode_difficulty"].to(torch.float16)
-+        else:
-+            self.episode_difficulties[:, ptr] = 0.0
 +        for key, storage in (
-+            ("initial_difficulty", self.initial_difficulties),
-+            ("disturbance_difficulty", self.disturbance_difficulties),
 +            ("motor_saturation_fraction", self.motor_saturation_fractions),
 +        ):
 +            storage[:, ptr] = tensor_dict[key].to(torch.float16) if key in tensor_dict.keys() else 0.0
@@ -281,19 +259,19 @@ index 273ac0e..0326a30 100644
          if self.asymmetric_obs:
              critic_observations = tensor_dict["critic_observations"]
              next_critic_observations = tensor_dict["next"]["critic_observations"]
-
+ 
 -            if self.playground_mode:
 +            if self.compact_asymmetric:
                  # Extract and store only the privileged part
                  privileged_observations = critic_observations[:, self.n_obs :]
                  next_privileged_observations = next_critic_observations[:, self.n_obs :]
-@@ -119,53 +285,300 @@ class SimpleReplayBuffer(nn.Module):
+@@ -119,53 +257,223 @@ class SimpleReplayBuffer(nn.Module):
                  # Store full critic observations
                  self.critic_observations[:, ptr] = critic_observations
                  self.next_critic_observations[:, ptr] = next_critic_observations
 +        self._mark_failure_context(ptr, dones, truncations)
          self.ptr += 1
-
+ 
 +    def _mark_failure_context(
 +        self,
 +        ptr: int,
@@ -334,35 +312,6 @@ index 273ac0e..0326a30 100644
 +            counts[order[:remainder]] += 1
 +        return [int(value) for value in counts.tolist()]
 +
-+    @classmethod
-+    def _allocate_with_capacities(cls, total: int, capacities: list[int]) -> list[int]:
-+        """Allocate an integer quota proportionally without exceeding capacities."""
-+
-+        allocated = [0 for _ in capacities]
-+        remaining = total
-+        while remaining > 0:
-+            available = [
-+                index
-+                for index, capacity in enumerate(capacities)
-+                if allocated[index] < capacity
-+            ]
-+            if not available:
-+                break
-+            spare = [capacities[index] - allocated[index] for index in available]
-+            spare_total = sum(spare)
-+            proposal = cls._quota_counts(
-+                remaining, tuple(value / spare_total for value in spare)
-+            )
-+            progressed = 0
-+            for local_index, index in enumerate(available):
-+                addition = min(proposal[local_index], capacities[index] - allocated[index])
-+                allocated[index] += addition
-+                progressed += addition
-+            if progressed == 0:
-+                break
-+            remaining -= progressed
-+        return allocated
-+
 +    def _draw(self, candidates: torch.Tensor, count: int) -> torch.Tensor:
 +        if count <= 0:
 +            return torch.empty(0, device=self.device, dtype=torch.long)
@@ -370,118 +319,67 @@ index 273ac0e..0326a30 100644
 +            torch.randint(0, candidates.numel(), (count,), device=self.device)
 +        ]
 +
-+    def _fallback_candidates(
++    def _draw_cell_balanced(
 +        self,
-+        labels: torch.Tensor,
-+        requested_band: int,
-+        excluded: torch.Tensor,
++        candidates: torch.Tensor,
++        cell_codes: torch.Tensor,
++        count: int,
 +    ) -> torch.Tensor:
-+        current = torch.nonzero((labels == 3) & ~excluded, as_tuple=False).squeeze(-1)
-+        if current.numel() > 0:
-+            return current
-+        other_impacts = torch.nonzero(
-+            (labels > 0) & (labels != requested_band) & ~excluded,
-+            as_tuple=False,
-+        ).squeeze(-1)
-+        if other_impacts.numel() > 0:
-+            return other_impacts
-+        any_non_excluded = torch.nonzero(~excluded, as_tuple=False).squeeze(-1)
-+        if any_non_excluded.numel() > 0:
-+            return any_non_excluded
-+        return torch.arange(labels.numel(), device=self.device)
++        """Draw equally from every curriculum cell currently present."""
++
++        if count <= 0:
++            return torch.empty(0, device=self.device, dtype=torch.long)
++        if candidates.numel() == 0:
++            raise RuntimeError("cell-balanced sampling requires at least one candidate")
++        unique_cells = torch.unique(cell_codes[candidates])
++        quotas = self._quota_counts(
++            count,
++            tuple(1.0 / unique_cells.numel() for _ in range(unique_cells.numel())),
++        )
++        pieces = []
++        for cell, quota in zip(unique_cells, quotas):
++            cell_candidates = candidates[cell_codes[candidates] == cell]
++            pieces.append(self._draw(cell_candidates, quota))
++        return torch.cat(pieces) if pieces else torch.empty(0, device=self.device, dtype=torch.long)
 +
 +    def _sample_stratified_flat(self, total: int, valid: int) -> torch.Tensor:
 +        labels = self.curriculum_bands[:, :valid].reshape(-1)
 +        phases = self.impact_phases[:, :valid].reshape(-1)
 +        failure_flags = self.failure_contexts[:, :valid].reshape(-1).bool()
-+        all_quotas = self._quota_counts(
++        cell_codes = (
++            (((self.a_levels[:, :valid].long() * 11 + self.b_levels[:, :valid].long()) * 11
++              + self.c_levels[:, :valid].long()) * 6)
++            + self.curriculum_focus[:, :valid].long()
++        ).reshape(-1)
++        quotas = self._quota_counts(
 +            total,
-+            (*self.band_balance_fractions, self.failure_context_fraction),
-+        )
-+        quotas = all_quotas[:5]
-+        failure_quota = all_quotas[5]
-+        impact_total = sum(quotas[1:])
-+        active_total = min(impact_total, int(round(total * self.active_impact_fraction)))
-+        recovery_total = min(
-+            impact_total - active_total,
-+            int(round(total * self.recovery_phase_fraction)),
++            self.curriculum_mix_fractions,
 +        )
 +        candidates_by_band = [
-+            torch.nonzero((labels == band) & ~failure_flags, as_tuple=False).squeeze(-1)
-+            for band in range(5)
++            torch.nonzero(labels == band, as_tuple=False).squeeze(-1)
++            for band in range(3)
 +        ]
-+        active_candidates_by_band = [
-+            candidates[phases[candidates] == 2]
-+            for candidates in candidates_by_band
-+        ]
-+        recovery_candidates_by_band = [
-+            candidates[phases[candidates] == 3]
-+            for candidates in candidates_by_band
-+        ]
-+        # Reallocate the phase quotas to whichever impact bands currently have
-+        # the rare transitions while preserving the five class totals.
-+        active_capacities = [
-+            quotas[band] if active_candidates_by_band[band].numel() > 0 else 0
-+            for band in range(1, 5)
-+        ]
-+        active_quotas = self._allocate_with_capacities(active_total, active_capacities)
-+        recovery_capacities = [
-+            max(0, quotas[band] - active_quotas[band - 1])
-+            if recovery_candidates_by_band[band].numel() > 0
-+            else 0
-+            for band in range(1, 5)
-+        ]
-+        recovery_quotas = self._allocate_with_capacities(
-+            recovery_total,
-+            recovery_capacities,
-+        )
-+
 +        pieces = []
-+        fallback_count = (
-+            active_total
-+            - sum(active_quotas)
-+            + recovery_total
-+            - sum(recovery_quotas)
-+        )
-+        failure_candidates = torch.nonzero(failure_flags, as_tuple=False).squeeze(-1)
-+        if failure_quota > 0:
-+            if failure_candidates.numel() == 0:
-+                failure_candidates = torch.arange(labels.numel(), device=self.device)
-+                fallback_count += failure_quota
-+            pieces.append(self._draw(failure_candidates, failure_quota))
++        fallback_count = 0
++        all_candidates = torch.arange(labels.numel(), device=self.device)
 +
 +        for band, quota in enumerate(quotas):
 +            if quota <= 0:
 +                continue
 +            candidates = candidates_by_band[band]
 +            if candidates.numel() == 0:
-+                candidates = self._fallback_candidates(labels, band, failure_flags)
-+                pieces.append(self._draw(candidates, quota))
++                candidates = all_candidates
 +                fallback_count += quota
-+                continue
-+
-+            active_quota = active_quotas[band - 1] if band > 0 else 0
-+            recovery_quota = recovery_quotas[band - 1] if band > 0 else 0
-+            if active_quota > 0:
-+                pieces.append(self._draw(active_candidates_by_band[band], active_quota))
-+            if recovery_quota > 0:
-+                pieces.append(self._draw(recovery_candidates_by_band[band], recovery_quota))
-+
-+            remaining = quota - active_quota - recovery_quota
-+            other_phase = candidates[(phases[candidates] != 2) & (phases[candidates] != 3)]
-+            fill_candidates = other_phase if other_phase.numel() > 0 else candidates
-+            pieces.append(self._draw(fill_candidates, remaining))
++            pieces.append(self._draw_cell_balanced(candidates, cell_codes, quota))
 +
 +        flat = torch.cat(pieces)
 +        flat = flat[torch.randperm(flat.numel(), device=self.device)]
 +        sampled_bands = labels[flat]
 +        sampled_phases = phases[flat]
 +        sampled_failures = failure_flags[flat]
-+        names = ("no_impact", "easy", "middle", "current", "probe")
++        names = ("mastered", "boundary", "probe")
 +        self.last_sample_stats = {
-+            f"sample_{name}": float(
-+                ((sampled_bands == band) & ~sampled_failures).float().mean().item()
-+            )
++            f"sample_{name}": float((sampled_bands == band).float().mean().item())
 +            for band, name in enumerate(names)
 +        }
 +        self.last_sample_stats["sample_failure_context"] = float(
@@ -503,7 +401,7 @@ index 273ac0e..0326a30 100644
 +        valid = min(self.buffer_size, self.ptr)
 +        if valid <= 0:
 +            raise RuntimeError("Cannot sample an empty replay buffer")
-+        if self.band_balance_fractions is not None:
++        if self.curriculum_mix_fractions is not None:
 +            total = self.n_env * batch_size
 +            flat = self._sample_stratified_flat(total, valid)
 +            return (flat // valid).reshape(self.n_env, batch_size), (flat % valid).reshape(
@@ -536,7 +434,7 @@ index 273ac0e..0326a30 100644
      @torch.no_grad()
      def sample(self, batch_size: int):
          # we will sample n_env * batch_size transitions
-
+ 
          if self.n_steps == 1:
 -            indices = torch.randint(
 -                0,
@@ -567,25 +465,28 @@ index 273ac0e..0326a30 100644
              )
 -
 -            rewards = torch.gather(self.rewards, 1, indices).reshape(
-+            sampled_impact_phases = self.impact_phases[env_indices, indices].reshape(
-+                self.n_env * batch_size
-+            )
-+            sampled_episode_difficulties = self.episode_difficulties[env_indices, indices].reshape(
++            sampled_curriculum_focus = self.curriculum_focus[env_indices, indices].reshape(
                  self.n_env * batch_size
              )
 -            dones = torch.gather(self.dones, 1, indices).reshape(
-+            sampled_initial_difficulties = self.initial_difficulties[env_indices, indices].reshape(
++            sampled_a_levels = self.a_levels[env_indices, indices].reshape(
                  self.n_env * batch_size
              )
 -            truncations = torch.gather(self.truncations, 1, indices).reshape(
-+            sampled_disturbance_difficulties = self.disturbance_difficulties[env_indices, indices].reshape(
++            sampled_b_levels = self.b_levels[env_indices, indices].reshape(
++                self.n_env * batch_size
++            )
++            sampled_c_levels = self.c_levels[env_indices, indices].reshape(
++                self.n_env * batch_size
++            )
++            sampled_impact_phases = self.impact_phases[env_indices, indices].reshape(
 +                self.n_env * batch_size
 +            )
 +            sampled_motor_saturation_fractions = self.motor_saturation_fractions[env_indices, indices].reshape(
 +                self.n_env * batch_size
 +            )
 +            sampled_domain_parameters = self.domain_parameters[env_indices, indices].reshape(
-+                self.n_env * batch_size, 8
++                self.n_env * batch_size, 9
 +            )
 +            sampled_failure_contexts = self.failure_contexts[env_indices, indices].reshape(
                  self.n_env * batch_size
@@ -610,10 +511,10 @@ index 273ac0e..0326a30 100644
 +                    next_privileged_observations = self.next_privileged_observations[env_indices, indices].reshape(
 +                        self.n_env * batch_size, self.privileged_obs_size
 +                    )
-
+ 
                      # Concatenate with regular observations to form full critic observations
                      critic_observations = torch.cat(
-@@ -223,7 +636,7 @@ class SimpleReplayBuffer(nn.Module):
+@@ -223,7 +531,7 @@ class SimpleReplayBuffer(nn.Module):
                  self.n_env * batch_size, self.n_act
              )
              if self.asymmetric_obs:
@@ -622,58 +523,56 @@ index 273ac0e..0326a30 100644
                      # Gather privileged observations
                      priv_obs_indices = indices.unsqueeze(-1).expand(
                          -1, -1, self.privileged_obs_size
-@@ -326,7 +739,7 @@ class SimpleReplayBuffer(nn.Module):
+@@ -326,7 +634,7 @@ class SimpleReplayBuffer(nn.Module):
              final_truncations = self.truncations.gather(1, final_next_obs_indices)
-
+ 
              if self.asymmetric_obs:
 -                if self.playground_mode:
 +                if self.compact_asymmetric:
                      # Gather final privileged observations
                      final_next_privileged_observations = (
                          self.next_privileged_observations.gather(
-@@ -392,12 +805,137 @@ class SimpleReplayBuffer(nn.Module):
+@@ -392,12 +700,107 @@ class SimpleReplayBuffer(nn.Module):
          if self.asymmetric_obs:
              out["critic_observations"] = critic_observations
              out["next"]["critic_observations"] = next_critic_observations
 +        if self.n_steps == 1:
 +            out["event_type"] = sampled_event_types
 +            out["curriculum_band"] = sampled_curriculum_bands
++            out["curriculum_focus"] = sampled_curriculum_focus
++            out["a_level"] = sampled_a_levels
++            out["b_level"] = sampled_b_levels
++            out["c_level"] = sampled_c_levels
 +            out["impact_phase"] = sampled_impact_phases
-+            out["episode_difficulty"] = sampled_episode_difficulties
-+            out["initial_difficulty"] = sampled_initial_difficulties
-+            out["disturbance_difficulty"] = sampled_disturbance_difficulties
 +            out["motor_saturation_fraction"] = sampled_motor_saturation_fractions
 +            out["domain_parameters"] = sampled_domain_parameters
 +            out["failure_context"] = sampled_failure_contexts
-
+ 
          if self.n_steps > 1 and self.ptr >= self.buffer_size:
              # Roll back the truncation flags introduced for safe sampling
              self.truncations[:, current_pos - 1] = curr_truncations
          return out
-
+ 
 +    @torch.no_grad()
 +    def diagnostics(self) -> dict[str, float]:
 +        valid = min(self.buffer_size, self.ptr)
 +        diagnostics = {
-+            "occupancy_no_impact": 0.0,
-+            "occupancy_easy": 0.0,
-+            "occupancy_middle": 0.0,
-+            "occupancy_current": 0.0,
++            "occupancy_mastered": 0.0,
++            "occupancy_boundary": 0.0,
 +            "occupancy_probe": 0.0,
 +            "occupancy_failure_context": 0.0,
 +            "occupancy_active_impact": 0.0,
 +            "occupancy_recovery_phase": 0.0,
-+            "legacy_metadata": float(self.legacy_metadata),
 +        }
 +        if valid <= 0:
 +            return diagnostics
 +        bands = self.curriculum_bands[:, :valid]
 +        phases = self.impact_phases[:, :valid]
 +        failures = self.failure_contexts[:, :valid].bool()
-+        names = ("no_impact", "easy", "middle", "current", "probe")
++        names = ("mastered", "boundary", "probe")
 +        for band, name in enumerate(names):
 +            diagnostics[f"occupancy_{name}"] = float(
-+                ((bands == band) & ~failures).float().mean().item()
++                (bands == band).float().mean().item()
 +            )
 +        diagnostics["occupancy_failure_context"] = float(failures.float().mean().item())
 +        diagnostics["occupancy_active_impact"] = float((phases == 2).float().mean().item())
@@ -683,7 +582,7 @@ index 273ac0e..0326a30 100644
 +    def checkpoint_state(self) -> dict:
 +        """Return a CPU replay snapshot for optional long-milestone checkpoints."""
 +        state = {
-+            "replay_metadata_version": 4,
++            "replay_metadata_version": 5,
 +            "ptr": self.ptr,
 +            "observations": self.observations.detach().cpu(),
 +            "actions": self.actions.detach().cpu(),
@@ -693,18 +592,16 @@ index 273ac0e..0326a30 100644
 +            "next_observations": self.next_observations.detach().cpu(),
 +            "event_types": self.event_types.detach().cpu(),
 +            "curriculum_bands": self.curriculum_bands.detach().cpu(),
++            "curriculum_focus": self.curriculum_focus.detach().cpu(),
++            "a_levels": self.a_levels.detach().cpu(),
++            "b_levels": self.b_levels.detach().cpu(),
++            "c_levels": self.c_levels.detach().cpu(),
 +            "impact_phases": self.impact_phases.detach().cpu(),
-+            "episode_difficulties": self.episode_difficulties.detach().cpu(),
-+            "initial_difficulties": self.initial_difficulties.detach().cpu(),
-+            "disturbance_difficulties": self.disturbance_difficulties.detach().cpu(),
 +            "motor_saturation_fractions": self.motor_saturation_fractions.detach().cpu(),
 +            "domain_parameters": self.domain_parameters.detach().cpu(),
 +            "failure_contexts": self.failure_contexts.detach().cpu(),
-+            "band_balance_fractions": self.band_balance_fractions,
-+            "failure_context_fraction": self.failure_context_fraction,
++            "curriculum_mix_fractions": self.curriculum_mix_fractions,
 +            "failure_context_steps": self.failure_context_steps,
-+            "active_impact_fraction": self.active_impact_fraction,
-+            "recovery_phase_fraction": self.recovery_phase_fraction,
 +        }
 +        if self.asymmetric_obs:
 +            state["privileged_observations"] = self.privileged_observations.detach().cpu()
@@ -713,6 +610,8 @@ index 273ac0e..0326a30 100644
 +
 +    @torch.no_grad()
 +    def load_checkpoint_state(self, state: dict) -> None:
++        if int(state.get("replay_metadata_version", 0)) != 5:
++            raise ValueError("Replay snapshots from the retired sampler cannot be resumed")
 +        self.ptr = int(state["ptr"])
 +        tensor_names = (
 +            "observations",
@@ -725,51 +624,23 @@ index 273ac0e..0326a30 100644
 +            "privileged_observations",
 +            "next_privileged_observations",
 +            "curriculum_bands",
++            "curriculum_focus",
++            "a_levels",
++            "b_levels",
++            "c_levels",
 +            "impact_phases",
-+            "episode_difficulties",
-+            "initial_difficulties",
-+            "disturbance_difficulties",
 +            "motor_saturation_fractions",
 +            "domain_parameters",
 +            "failure_contexts",
 +        )
 +        for name in tensor_names:
-+            if name == "curriculum_bands":
-+                continue
 +            if name in state and hasattr(self, name):
 +                getattr(self, name).copy_(state[name].to(self.device))
 +
-+        if "curriculum_bands" not in state:
-+            self.curriculum_bands.copy_((self.event_types > 0).to(torch.uint8) * 3)
-+            self.impact_phases.zero_()
-+            self.episode_difficulties.zero_()
-+            self.legacy_metadata = True
-+        else:
-+            bands = state["curriculum_bands"].to(self.device, dtype=torch.uint8)
-+            if int(state.get("replay_metadata_version", 1)) < 2:
-+                migrated = bands.clone()
-+                migrated[bands == 2] = 3
-+                migrated[bands == 3] = 4
-+                bands = migrated
-+                self.legacy_metadata = True
-+            else:
-+                self.legacy_metadata = False
-+            self.curriculum_bands.copy_(bands)
-+        if "failure_contexts" not in state:
-+            self.failure_contexts.zero_()
-+        for name in (
-+            "initial_difficulties",
-+            "disturbance_difficulties",
-+            "motor_saturation_fractions",
-+            "domain_parameters",
-+        ):
-+            if name not in state:
-+                getattr(self, name).zero_()
-+
-
+ 
  class EmpiricalNormalization(nn.Module):
      """Normalize mean and variance of values based on empirical values."""
-@@ -761,6 +1299,14 @@ def save_params(
+@@ -761,6 +1164,14 @@ def save_params(
      critic_obs_normalizer,
      args,
      save_path,
@@ -783,8 +654,8 @@ index 273ac0e..0326a30 100644
 +    replay_buffer=None,
  ):
      """Save model parameters and training configuration to disk."""
-
-@@ -787,6 +1333,21 @@ def save_params(
+ 
+@@ -787,6 +1198,21 @@ def save_params(
          ),
          "args": vars(args),  # Save all arguments
          "global_step": global_step,
@@ -1156,14 +1027,15 @@ index 0000000..5dd7831
 +        # training curriculum or episode metrics.
 +        env.reset(random_start_init=False)
 diff --git a/fast_td3/hyperparams.py b/fast_td3/hyperparams.py
-index 04c111e..7834b94 100644
+index 04c111e..3a20274 100644
 --- a/fast_td3/hyperparams.py
 +++ b/fast_td3/hyperparams.py
-@@ -26,7 +26,13 @@ class BaseArgs:
+@@ -26,8 +26,18 @@ class BaseArgs:
      """the project name"""
      use_wandb: bool = True
      """whether to use wandb"""
 -    checkpoint_path: str = None
+-    """the path to the checkpoint file"""
 +    output_root: str = "outputs"
 +    """root directory for timestamped logs, TensorBoard events, and checkpoints"""
 +    use_tensorboard: bool = True
@@ -1171,33 +1043,32 @@ index 04c111e..7834b94 100644
 +    log_interval: int = 100
 +    """vector-environment steps between local metric records"""
 +    checkpoint_path: str | None = None
-     """the path to the checkpoint file"""
++    """path for a full training-state resume"""
++    pretrained_checkpoint_path: str | None = None
++    """path for loading only actor weights and actor observation normalization"""
++    pretrained_actor_freeze_steps: int = 2000
++    """critic-only global steps before updating an actor loaded by warm start"""
      num_envs: int = 128
      """the number of environments to run in parallel"""
-@@ -124,6 +130,22 @@ class BaseArgs:
+     num_eval_envs: int = 128
+@@ -124,6 +134,16 @@ class BaseArgs:
      """the weight decay of the optimizer"""
      save_interval: int = 5000
      """the interval to save the model"""
 +    event_balance_fraction: float | None = None
 +    """fraction of impact transitions in a replay sample; None keeps uniform sampling"""
-+    band_balance_fractions: tuple[float, float, float, float, float] | None = None
-+    """fractions for no-impact, easy, middle, current, and probe Replay samples"""
-+    failure_context_fraction: float = 0.0
-+    """fraction reserved for transitions immediately preceding a physical failure"""
++    curriculum_mix_fractions: tuple[float, float, float] | None = None
++    """fractions for mastered, boundary, and probe curriculum Replay samples"""
 +    failure_context_steps: int = 50
-+    """maximum causal failure-context length, in control steps"""
-+    active_impact_fraction: float = 0.0
-+    """minimum target fraction of active-impact transitions in a Replay sample"""
-+    recovery_phase_fraction: float = 0.0
-+    """minimum target fraction of early post-impact recovery transitions"""
++    """diagnostic causal failure-context length, in control steps"""
 +    checkpoint_replay: bool = False
 +    """include the large replay tensor snapshot only for long-milestone checkpoints"""
 +    target_noise_scale: tuple[float, ...] = (1.0,)
 +    """per-action target-policy smoothing scale for [thrust, roll rate, pitch rate, yaw rate]"""
-
+ 
      sim_type: str = ""
      """SimNorm mode: '', sim_actor, sim_critic, or sim_both"""
-@@ -183,6 +205,7 @@ def get_args():
+@@ -183,6 +203,7 @@ def get_args():
          "Isaac-Velocity-Rough-G1-v0": IsaacVelocityRoughG1Args,
          "Isaac-Repose-Cube-Allegro-Direct-v0": IsaacReposeCubeAllegroDirectArgs,
          "Isaac-Repose-Cube-Shadow-Direct-v0": IsaacReposeCubeShadowDirectArgs,
@@ -1205,7 +1076,7 @@ index 04c111e..7834b94 100644
          # MTBench
          "MTBench-meta-world-v2-mt10": MetaWorldMT10Args,
          "MTBench-meta-world-v2-mt50": MetaWorldMT50Args,
-@@ -448,7 +471,46 @@ class IsaacLabArgs(BaseArgs):
+@@ -448,7 +469,37 @@ class IsaacLabArgs(BaseArgs):
      std_max: float = 0.4
      num_atoms: int = 251
      render_interval: int = 0  # IsaacLab does not support rendering in our codebase
@@ -1233,32 +1104,23 @@ index 04c111e..7834b94 100644
 +    std_max: float = 0.20
 +    target_noise_scale: tuple[float, ...] = (0.75, 1.0, 1.0, 0.75)
 +    event_balance_fraction: float | None = None
-+    band_balance_fractions: tuple[float, float, float, float, float] | None = (
-+        0.10,
-+        0.15,
-+        0.20,
-+        0.35,
-+        0.10,
-+    )
-+    failure_context_fraction: float = 0.10
++    curriculum_mix_fractions: tuple[float, float, float] | None = None
 +    failure_context_steps: int = 50
-+    active_impact_fraction: float = 0.05
-+    recovery_phase_fraction: float = 0.20
 +    use_grad_norm_clipping: bool = True
 +    max_grad_norm: float = 10.0
 +    compile: bool = False
 +    log_interval: int = 100
 +    save_interval: int = 25000
 +    total_timesteps: int = 250000
-
-
+ 
+ 
  @dataclass
 diff --git a/fast_td3/local_logging.py b/fast_td3/local_logging.py
 new file mode 100644
-index 0000000..364ed47
+index 0000000..52b0daa
 --- /dev/null
 +++ b/fast_td3/local_logging.py
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,196 @@
 +"""Local, reproducible training artifacts for FastTD3 runs.
 +
 +The upstream implementation treats Weights & Biases as the only metric sink and
@@ -1455,7 +1317,6 @@ index 0000000..364ed47
 +            self.summary_writer.flush()
 +            self.summary_writer.close()
 +        self.closed = True
-+
 diff --git a/fast_td3/round_reporting.py b/fast_td3/round_reporting.py
 new file mode 100644
 index 0000000..814db7b
@@ -1568,14 +1429,14 @@ index 0000000..814db7b
 +    )
 +    return RoundReportPaths(markdown, summary_csv, training_png, recovery_png)
 diff --git a/fast_td3/train.py b/fast_td3/train.py
-index 8aa1b32..51ac1c5 100644
+index 8aa1b32..ee1febd 100644
 --- a/fast_td3/train.py
 +++ b/fast_td3/train.py
 @@ -1,5 +1,6 @@
  import os
  import sys
 +import atexit
-
+ 
  os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
  os.environ["OMP_NUM_THREADS"] = "1"
 @@ -13,6 +14,7 @@ os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"
@@ -1583,7 +1444,7 @@ index 8aa1b32..51ac1c5 100644
  import time
  import math
 +from collections import deque
-
+ 
  import tqdm
  import wandb
 @@ -37,10 +39,15 @@ from fast_td3_utils import (
@@ -1599,13 +1460,13 @@ index 8aa1b32..51ac1c5 100644
 +from local_logging import LocalTrainingLogger, create_run_paths
 +from fixed_impact_evaluation import evaluate_fixed_five_impacts
 +from round_reporting import write_round_report
-
+ 
  torch.set_float32_matmul_precision("high")
-
-@@ -50,10 +57,25 @@ except ImportError:
+ 
+@@ -50,10 +57,82 @@ except ImportError:
      pass
-
-
+ 
+ 
 +def optional_optimizer_metric(logs_dict, key, *, optimizer_updated, device):
 +    """Return a reduced optimizer metric, or NaN when that optimizer did not run."""
 +    if optimizer_updated and key in logs_dict:
@@ -1613,8 +1474,65 @@ index 8aa1b32..51ac1c5 100644
 +    return torch.tensor(float("nan"), device=device)
 +
 +
++def validate_checkpoint_selection(checkpoint_path, pretrained_checkpoint_path):
++    """Reject ambiguous requests to resume and warm-start at the same time."""
++
++    if checkpoint_path and pretrained_checkpoint_path:
++        raise ValueError(
++            "checkpoint_path and pretrained_checkpoint_path are mutually exclusive"
++        )
++
++
++def actor_update_start_step(
++    *,
++    learning_starts,
++    pretrained_checkpoint_path,
++    pretrained_actor_freeze_steps,
++):
++    """Return when actor optimization may begin for this run."""
++
++    if not pretrained_checkpoint_path:
++        return int(learning_starts)
++    if pretrained_actor_freeze_steps < learning_starts:
++        raise ValueError(
++            "pretrained_actor_freeze_steps must be no smaller than learning_starts"
++        )
++    return int(pretrained_actor_freeze_steps)
++
++
++def load_actor_warm_start(checkpoint_path, *, actor, obs_normalizer, map_location):
++    """Load policy state only; all value-learning and training state stays fresh."""
++
++    checkpoint = torch.load(
++        str(checkpoint_path), map_location=map_location, weights_only=False
++    )
++    checkpoint_actor_state = checkpoint["actor_state_dict"]
++    actor_state = actor.state_dict()
++    for name, parameter in actor.named_parameters():
++        if name not in checkpoint_actor_state:
++            raise KeyError(f"actor parameter missing from warm-start checkpoint: {name}")
++        checkpoint_value = checkpoint_actor_state[name]
++        if checkpoint_value.shape != parameter.shape:
++            raise RuntimeError(
++                f"actor parameter shape mismatch for {name}: "
++                f"checkpoint={tuple(checkpoint_value.shape)} current={tuple(parameter.shape)}"
++            )
++        actor_state[name] = checkpoint_value
++    actor.load_state_dict(actor_state)
++    obs_normalizer.load_state_dict(checkpoint["obs_normalizer_state"])
++    return int(checkpoint.get("global_step", 0))
++
++
  def main():
      args = get_args()
++    validate_checkpoint_selection(
++        args.checkpoint_path, args.pretrained_checkpoint_path
++    )
++    actor_learning_starts = actor_update_start_step(
++        learning_starts=args.learning_starts,
++        pretrained_checkpoint_path=args.pretrained_checkpoint_path,
++        pretrained_actor_freeze_steps=args.pretrained_actor_freeze_steps,
++    )
      print(args)
      run_name = f"{args.env_name}__{args.exp_name}__{args.seed}"
 +    run_paths = create_run_paths(args.output_root, args.env_name, args.seed)
@@ -1625,22 +1543,32 @@ index 8aa1b32..51ac1c5 100644
 +    )
 +    atexit.register(local_logger.close)
 +    print(f"Run artifacts: {run_paths.run_dir.resolve()}")
-
+ 
      amp_enabled = args.amp and args.cuda and torch.cuda.is_available()
      amp_device_type = (
-@@ -88,6 +110,9 @@ def main():
+@@ -88,6 +167,9 @@ def main():
          else:
              raise ValueError("No GPU available")
      print(f"Using device: {device}")
 +    if device.type == "cuda":
 +        torch.cuda.current_device()
 +        torch.cuda.reset_peak_memory_stats(device.index)
-
+ 
      if args.env_name.startswith("h1hand-") or args.env_name.startswith("h1-"):
          from environments.humanoid_bench_env import HumanoidBenchEnv
-@@ -202,7 +227,12 @@ def main():
+@@ -135,6 +217,9 @@ def main():
+             use_push_randomization=args.use_push_randomization,
+         )
+ 
++    if env_type == "isaaclab":
++        envs.set_training_discount(args.gamma)
++
+     n_act = envs.num_actions
+     n_obs = envs.num_obs if type(envs.num_obs) == int else envs.num_obs[0]
+     if envs.asymmetric_obs:
+@@ -202,7 +287,12 @@ def main():
          critic_kwargs["task_embedding_dim"] = args.task_embedding_dim
-
+ 
      if args.agent == "fasttd3":
 -        if env_type in ["mtbench"]:
 +        if args.env_name == "Isaac-FlightLxx-CTBR-Recovery-Direct-v0":
@@ -1650,23 +1578,41 @@ index 8aa1b32..51ac1c5 100644
 +            critic_cls = HistoryCritic
 +        elif env_type in ["mtbench"]:
              from fast_td3 import MultiTaskActor, MultiTaskCritic
-
+ 
              actor_cls = MultiTaskActor
-@@ -319,6 +349,12 @@ def main():
+@@ -273,6 +363,20 @@ def main():
+ 
+     actor = actor_cls(**actor_kwargs)
+ 
++    if args.pretrained_checkpoint_path:
++        source_step = load_actor_warm_start(
++            args.pretrained_checkpoint_path,
++            actor=actor,
++            obs_normalizer=obs_normalizer,
++            map_location=device,
++        )
++        print(
++            "Actor warm start loaded from "
++            f"{args.pretrained_checkpoint_path} (source global step {source_step}); "
++            "critic, replay, optimizers, reward normalization, global step, and "
++            "environment training state remain fresh"
++        )
++
+     if env_type in ["mtbench"]:
+         # Python 3.8 doesn't support 'from_module' in tensordict
+         policy = actor.explore
+@@ -319,6 +423,9 @@ def main():
          n_critic_obs=n_critic_obs,
          asymmetric_obs=envs.asymmetric_obs,
          playground_mode=env_type == "mujoco_playground",
 +        event_balance_fraction=args.event_balance_fraction,
-+        band_balance_fractions=args.band_balance_fractions,
-+        failure_context_fraction=args.failure_context_fraction,
++        curriculum_mix_fractions=args.curriculum_mix_fractions,
 +        failure_context_steps=args.failure_context_steps,
-+        active_impact_fraction=args.active_impact_fraction,
-+        recovery_phase_fraction=args.recovery_phase_fraction,
          n_steps=args.num_steps,
          gamma=args.gamma,
          device=device,
-@@ -326,6 +362,11 @@ def main():
-
+@@ -326,6 +433,11 @@ def main():
+ 
      policy_noise = args.policy_noise
      noise_clip = args.noise_clip
 +    target_noise_scale = torch.tensor(args.target_noise_scale, device=device)
@@ -1674,25 +1620,25 @@ index 8aa1b32..51ac1c5 100644
 +        target_noise_scale = target_noise_scale.expand(n_act)
 +    elif target_noise_scale.numel() != n_act:
 +        raise ValueError(f"target_noise_scale must have 1 or {n_act} values")
-
+ 
      def evaluate():
          num_eval_envs = eval_envs.num_envs
-@@ -424,10 +465,8 @@ def main():
+@@ -424,10 +536,8 @@ def main():
              else:
                  bootstrap = (truncations | ~dones).float()
-
+ 
 -            clipped_noise = torch.randn_like(actions)
 -            clipped_noise = clipped_noise.mul(policy_noise).clamp(
 -                -noise_clip, noise_clip
 -            )
 +            clipped_noise = torch.randn_like(actions) * target_noise_scale
 +            clipped_noise = clipped_noise.mul(policy_noise).clamp(-noise_clip, noise_clip)
-
+ 
              next_state_actions = (actor(next_observations) + clipped_noise).clamp(
                  action_low, action_high
-@@ -461,6 +500,10 @@ def main():
+@@ -461,6 +571,10 @@ def main():
                      )
-
+ 
              qf1, qf2 = qnet(critic_observations, actions)
 +            qf1_probability = F.softmax(qf1, dim=1)
 +            qf2_probability = F.softmax(qf2, dim=1)
@@ -1701,7 +1647,7 @@ index 8aa1b32..51ac1c5 100644
              qf1_loss = -torch.sum(
                  qf1_next_target_dist * F.log_softmax(qf1, dim=1), dim=1
              ).mean()
-@@ -487,6 +530,13 @@ def main():
+@@ -487,6 +601,13 @@ def main():
          logs_dict["qf_loss"] = qf_loss.detach()
          logs_dict["qf_max"] = qf1_next_target_value.max().detach()
          logs_dict["qf_min"] = qf1_next_target_value.min().detach()
@@ -1713,9 +1659,9 @@ index 8aa1b32..51ac1c5 100644
 +        if "event_type" in data.keys():
 +            logs_dict["replay_impact_fraction"] = data["event_type"].float().mean().detach()
          return logs_dict
-
+ 
      def update_pol(data, logs_dict):
-@@ -566,6 +616,20 @@ def main():
+@@ -566,6 +687,20 @@ def main():
          )
          qnet.load_state_dict(torch_checkpoint["qnet_state_dict"])
          qnet_target.load_state_dict(torch_checkpoint["qnet_target_state_dict"])
@@ -1736,7 +1682,7 @@ index 8aa1b32..51ac1c5 100644
          global_step = torch_checkpoint["global_step"]
      else:
          global_step = 0
-@@ -574,10 +638,17 @@ def main():
+@@ -574,10 +709,17 @@ def main():
      pbar = tqdm.tqdm(total=args.total_timesteps, initial=global_step)
      start_time = None
      desc = ""
@@ -1745,7 +1691,7 @@ index 8aa1b32..51ac1c5 100644
 +    recent_episode_returns = deque(maxlen=100)
 +    recent_episode_lengths = deque(maxlen=100)
 +    latest_env_logs = {}
-
+ 
      while global_step < args.total_timesteps:
          mark_step()
          logs_dict = TensorDict()
@@ -1754,8 +1700,8 @@ index 8aa1b32..51ac1c5 100644
          if (
              start_time is None
              and global_step >= args.measure_burnin + args.learning_starts
-@@ -593,6 +664,20 @@ def main():
-
+@@ -593,6 +735,20 @@ def main():
+ 
          next_obs, rewards, dones, infos = envs.step(actions.float())
          truncations = infos["time_outs"]
 +        episode_returns += rewards
@@ -1772,10 +1718,10 @@ index 8aa1b32..51ac1c5 100644
 +            episode_lengths[completed] = 0
 +        if "log" in infos:
 +            latest_env_logs.update(infos["log"])
-
+ 
          if args.reward_normalization:
              if env_type == "mtbench":
-@@ -634,13 +719,21 @@ def main():
+@@ -634,13 +790,21 @@ def main():
          if envs.asymmetric_obs:
              transition["critic_observations"] = critic_obs
              transition["next"]["critic_observations"] = true_next_critic_obs
@@ -1785,11 +1731,11 @@ index 8aa1b32..51ac1c5 100644
 +        for name, value in extract_replay_metadata(infos, transition["event_type"]).items():
 +            transition[name] = value
          rb.extend(transition)
-
+ 
          obs = next_obs
          if envs.asymmetric_obs:
              critic_obs = next_critic_obs
-
+ 
 -        if global_step > args.learning_starts:
 +        # Check the current replay occupancy, not the restored global step.
 +        # Checkpoints do not contain replay data, so resumed runs must collect a
@@ -1798,22 +1744,30 @@ index 8aa1b32..51ac1c5 100644
              for i in range(args.num_updates):
                  data = rb.sample(max(1, args.batch_size // args.num_envs))
                  data["observations"] = normalize_obs(data["observations"])
-@@ -666,36 +759,85 @@ def main():
+@@ -666,36 +830,94 @@ def main():
                      data["next"]["rewards"] = normalize_reward(raw_rewards)
-
+ 
                  logs_dict = update_main(data, logs_dict)
 +                q_optimizer_updated = True
                  if args.num_updates > 1:
-                     if i % args.policy_frequency == 1:
+-                    if i % args.policy_frequency == 1:
++                    if (
++                        global_step >= actor_learning_starts
++                        and i % args.policy_frequency == 1
++                    ):
                          logs_dict = update_pol(data, logs_dict)
 +                        actor_optimizer_updated = True
                  else:
-                     if global_step % args.policy_frequency == 0:
+-                    if global_step % args.policy_frequency == 0:
++                    if (
++                        global_step >= actor_learning_starts
++                        and global_step % args.policy_frequency == 0
++                    ):
                          logs_dict = update_pol(data, logs_dict)
 +                        actor_optimizer_updated = True
-
+ 
                  soft_update(qnet, qnet_target, args.tau)
-
+ 
 -            if global_step % 100 == 0 and start_time is not None:
 +            if global_step % args.log_interval == 0 and start_time is not None:
                  speed = (global_step - measure_burnin) / (time.time() - start_time)
@@ -1845,6 +1799,9 @@ index 8aa1b32..51ac1c5 100644
 +                        "replay_impact_fraction": logs_dict.get("replay_impact_fraction", torch.tensor(0.0, device=device)),
 +                        "train/vector_sps": speed,
 +                        "train/sample_sps": speed * args.num_envs,
++                        "train/actor_frozen": float(
++                            global_step < actor_learning_starts
++                        ),
 +                        "frame": global_step * args.num_envs,
 +                        "critic_lr": q_scheduler.get_last_lr()[0],
 +                        "actor_lr": actor_scheduler.get_last_lr()[0],
@@ -1871,7 +1828,7 @@ index 8aa1b32..51ac1c5 100644
 +                        )
 +                    logs.update(latest_env_logs)
 +                    logs.update(replay_log_metrics(rb))
-
+ 
                      if args.eval_interval > 0 and global_step % args.eval_interval == 0:
                          print(f"Evaluating at global step {global_step}")
                          eval_avg_return, eval_avg_length = evaluate()
@@ -1887,8 +1844,8 @@ index 8aa1b32..51ac1c5 100644
 +                            dones = None
                          logs["eval_avg_return"] = eval_avg_return
                          logs["eval_avg_length"] = eval_avg_length
-
-@@ -712,15 +854,10 @@ def main():
+ 
+@@ -712,15 +934,10 @@ def main():
                              format="gif",
                          )
                          logs["render_video"] = render_video
@@ -1905,8 +1862,8 @@ index 8aa1b32..51ac1c5 100644
 +                        logs,
                          step=global_step,
                      )
-
-@@ -738,12 +875,35 @@ def main():
+ 
+@@ -738,12 +955,35 @@ def main():
                      obs_normalizer,
                      critic_obs_normalizer,
                      args,
@@ -1934,7 +1891,7 @@ index 8aa1b32..51ac1c5 100644
 +                    episode_returns.zero_()
 +                    episode_lengths.zero_()
 +                    dones = None
-
+ 
          global_step += 1
 -        actor_scheduler.step()
 -        q_scheduler.step()
@@ -1943,9 +1900,9 @@ index 8aa1b32..51ac1c5 100644
 +        if actor_optimizer_updated:
 +            actor_scheduler.step()
          pbar.update(1)
-
+ 
      save_params(
-@@ -754,8 +914,23 @@ def main():
+@@ -754,8 +994,23 @@ def main():
          obs_normalizer,
          critic_obs_normalizer,
          args,
@@ -1967,6 +1924,6 @@ index 8aa1b32..51ac1c5 100644
 +        )
 +    write_round_report(run_paths.run_dir)
 +    local_logger.close()
-
-
+ 
+ 
  if __name__ == "__main__":

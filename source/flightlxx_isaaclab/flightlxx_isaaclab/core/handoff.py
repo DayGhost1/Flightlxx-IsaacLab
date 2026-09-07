@@ -70,6 +70,8 @@ def sample_handoff_state(
     if full.any():
         orientation[full] = _uniform_quaternion(int(full.sum()), device, generator)
     return HandoffState(position, velocity, orientation, angular_velocity)
+
+
 def fixed_target_hover_state(
     default_root_state: torch.Tensor,
     target_position: torch.Tensor,

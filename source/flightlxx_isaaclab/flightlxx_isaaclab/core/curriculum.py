@@ -1,408 +1,449 @@
+"""Current-difficulty curriculum for hover, handoff and impact recovery."""
+
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from typing import Mapping
 
 import torch
 
 
-@dataclass(frozen=True)
-class ImpactCurriculumCfg:
-    """Configuration for the bidirectional five-band impact curriculum."""
+HANDOFF_SCENARIO = 0
+IMPACT_SCENARIO = 1
+HANDOFF_IMPACT_SCENARIO = 2
+# Kept as an alias for callers using the previous name.
+SINGLE_IMPACT_SCENARIO = IMPACT_SCENARIO
+RECOVERY_SCENARIO_NAMES = ("handoff", "impact", "handoff_impact")
 
-    no_impact_fraction: float = 0.15
-    easy_fraction: float = 0.15
-    middle_fraction: float = 0.25
-    current_fraction: float = 0.35
-    probe_fraction: float = 0.10
-
-    no_impact_window_episodes: int = 512
-    current_window_episodes: int = 2048
-    probe_window_episodes: int = 512
-
-    promote_no_impact_success_rate: float = 0.90
-    promote_current_success_rate: float = 0.70
-    promote_current_crash_rate: float = 0.05
-    promote_probe_success_rate: float = 0.50
-    demote_current_success_rate: float = 0.35
-    demote_current_crash_rate: float = 0.15
-
-    promote_step: float = 0.05
-    demote_step: float = 0.025
-    minimum_difficulty: float = 0.10
-    probe_band_width: float = 0.10
-    consecutive_windows: int = 3
-    cooldown_steps: int = 5000
+MIX_HOVER = 0
+MIX_CURRENT = 1
+MIX_REHEARSAL = 2
+MIX_PROBE = 3
 
 
-@dataclass
-class CurriculumSample:
-    impacted: torch.Tensor
-    difficulty: torch.Tensor
-    band: torch.Tensor
+def assess_curriculum_exam(
+    tail_metrics: Mapping[str, torch.Tensor],
+    *,
+    crashed: torch.Tensor,
+    groups: Mapping[str, torch.Tensor],
+    limits: Mapping[str, float],
+) -> dict[str, dict[str, float]]:
+    """Summarize one exam from per-step physical errors in its final window.
 
-
-@dataclass(frozen=True)
-class TwoStageCurriculumCfg:
-    """Interleave handoff and easy-impact exposure without a deadlock gate."""
-
-    initial_step: float = 0.05
-    disturbance_step: float = 0.025
-    impact_probability_step: float = 0.05
-    initial_disturbance_difficulty: float = 0.05
-    initial_impact_probability: float = 0.05
-    minimum_initial_difficulty: float = 0.05
-    promote_success_rate: float = 0.70
-    promote_crash_rate: float = 0.05
-    consecutive_windows: int = 3
-    stagnation_steps: int = 10_000
-
-
-@dataclass(frozen=True)
-class TwoStageCurriculumSample:
-    initial_difficulty: float
-    disturbance_difficulty: float
-    impact_probability: float
-
-
-class TwoStageCurriculum:
-    """Interleaved outer course; retained name preserves checkpoint compatibility."""
-
-    def __init__(self, cfg: TwoStageCurriculumCfg | None = None, *, initial_difficulty: float = 0.10):
-        self.cfg = cfg or TwoStageCurriculumCfg()
-        if self.cfg.initial_step <= 0.0 or self.cfg.disturbance_step <= 0.0:
-            raise ValueError("curriculum steps must be positive")
-        if self.cfg.impact_probability_step <= 0.0:
-            raise ValueError("impact_probability_step must be positive")
-        if self.cfg.consecutive_windows <= 0:
-            raise ValueError("consecutive_windows must be positive")
-        if self.cfg.stagnation_steps <= 0:
-            raise ValueError("stagnation_steps must be positive")
-        self.initial_difficulty = float(
-            min(1.0, max(self.cfg.minimum_initial_difficulty, initial_difficulty))
-        )
-        self.disturbance_difficulty = float(
-            min(1.0, max(0.0, self.cfg.initial_disturbance_difficulty))
-        )
-        self.impact_probability = float(
-            min(1.0, max(0.0, self.cfg.initial_impact_probability))
-        )
-        self._promotion_streak = 0
-        self._last_progress_step = 0
-
-    def sample(self) -> TwoStageCurriculumSample:
-        return TwoStageCurriculumSample(
-            self.initial_difficulty,
-            self.disturbance_difficulty,
-            self.impact_probability,
-        )
-
-    def record_window(
-        self,
-        *,
-        success_rate: float,
-        crash_rate: float,
-        global_step: int | None = None,
-    ) -> TwoStageCurriculumSample:
-        if not 0.0 <= success_rate <= 1.0 or not 0.0 <= crash_rate <= 1.0:
-            raise ValueError("success_rate and crash_rate must lie in [0, 1]")
-        mastered = success_rate >= self.cfg.promote_success_rate and crash_rate <= self.cfg.promote_crash_rate
-        self._promotion_streak = self._promotion_streak + 1 if mastered else 0
-        if self._promotion_streak >= self.cfg.consecutive_windows:
-            self.initial_difficulty = min(1.0, self.initial_difficulty + self.cfg.initial_step)
-            self.disturbance_difficulty = min(
-                1.0, self.disturbance_difficulty + self.cfg.disturbance_step
-            )
-            self.impact_probability = min(
-                1.0, self.impact_probability + self.cfg.impact_probability_step
-            )
-            self._promotion_streak = 0
-            if global_step is not None:
-                self._last_progress_step = int(global_step)
-        elif (
-            global_step is not None
-            and int(global_step) - self._last_progress_step >= self.cfg.stagnation_steps
-            and self.initial_difficulty > self.cfg.minimum_initial_difficulty
-        ):
-            self.initial_difficulty = max(
-                self.cfg.minimum_initial_difficulty,
-                self.initial_difficulty - self.cfg.initial_step,
-            )
-            self._last_progress_step = int(global_step)
-        return self.sample()
-
-
-@dataclass
-class _BandStats:
-    episodes: int = 0
-    successes: int = 0
-    crashes: int = 0
-
-    def add(self, recovered: torch.Tensor, crashed: torch.Tensor, mask: torch.Tensor) -> None:
-        self.episodes += int(mask.sum().item())
-        self.successes += int((recovered & mask).sum().item())
-        self.crashes += int((crashed & mask).sum().item())
-
-    def reset(self) -> None:
-        self.episodes = self.successes = self.crashes = 0
-
-    def state_dict(self) -> dict[str, int]:
-        return asdict(self)
-
-    def load_state_dict(self, state: dict | None) -> None:
-        state = state or {}
-        self.episodes = int(state.get("episodes", 0))
-        self.successes = int(state.get("successes", 0))
-        self.crashes = int(state.get("crashes", 0))
-
-
-class ImpactCurriculum:
-    """Bidirectional curriculum with five persistent difficulty bands.
-
-    Band IDs are 0=no impact, 1=easy, 2=middle, 3=current and 4=probe.
-    Easy and middle episodes preserve coverage but do not vote on a level
-    change.
+    Pass/fail uses per-environment p95 only.  RMS is still logged so brief
+    spikes remain visible, but they no longer decide promotion or retreat.
     """
 
-    STATE_VERSION = 3
+    strict_success = ~crashed.bool()
+    coarse_success = ~crashed.bool()
+    summaries: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    for name, limit in limits.items():
+        values = tail_metrics[name]
+        rms = values.square().mean(dim=0).sqrt()
+        p95 = torch.quantile(values, 0.95, dim=0)
+        strict_failure = p95 > limit
+        coarse_failure = p95 > 2.0 * limit
+        summaries[name] = (rms, p95, strict_failure, coarse_failure)
+        strict_success &= p95 <= limit
+        coarse_success &= p95 <= 2.0 * limit
 
-    def __init__(self, cfg: ImpactCurriculumCfg | None = None, initial_difficulty: float = 0.10):
-        self.cfg = cfg or ImpactCurriculumCfg()
-        fractions = (
-            self.cfg.no_impact_fraction,
-            self.cfg.easy_fraction,
-            self.cfg.middle_fraction,
-            self.cfg.current_fraction,
-            self.cfg.probe_fraction,
-        )
-        if any(value < 0.0 for value in fractions) or abs(sum(fractions) - 1.0) > 1.0e-6:
-            raise ValueError("curriculum band fractions must be non-negative and sum to one")
-        windows = (
-            self.cfg.no_impact_window_episodes,
-            self.cfg.current_window_episodes,
-            self.cfg.probe_window_episodes,
-        )
-        if any(value <= 0 for value in windows):
-            raise ValueError("curriculum window sizes must be positive")
-        if self.cfg.consecutive_windows <= 0 or self.cfg.cooldown_steps < 0:
-            raise ValueError("consecutive_windows must be positive and cooldown_steps non-negative")
-        if self.cfg.promote_step <= 0.0 or self.cfg.demote_step <= 0.0:
-            raise ValueError("curriculum step sizes must be positive")
-        if not 0.0 <= self.cfg.minimum_difficulty <= 1.0:
-            raise ValueError("minimum_difficulty must lie in [0, 1]")
+    assessment: dict[str, dict[str, float]] = {}
+    for group_name, ids in groups.items():
+        metrics = {
+            "strict_success_rate": strict_success[ids].float().mean().item(),
+            "coarse_success_rate": coarse_success[ids].float().mean().item(),
+            "crash_rate": crashed[ids].float().mean().item(),
+        }
+        for metric_name, (rms, p95, strict_failure, coarse_failure) in summaries.items():
+            metrics[f"{metric_name}_rms"] = rms[ids].mean().item()
+            metrics[f"{metric_name}_p95"] = p95[ids].mean().item()
+            metrics[f"{metric_name}_strict_failure_rate"] = (
+                strict_failure[ids].float().mean().item()
+            )
+            metrics[f"{metric_name}_coarse_failure_rate"] = (
+                coarse_failure[ids].float().mean().item()
+            )
+        assessment[group_name] = metrics
+    return assessment
 
-        self.difficulty = float(
-            min(1.0, max(self.cfg.minimum_difficulty, initial_difficulty))
-        )
-        self.mastered_difficulty = 0.0
-        self.promotion_count = 0
-        self.demotion_count = 0
-        self.promotion_streak = 0
-        self.demotion_streak = 0
-        self.next_change_step = 0
-        self.last_action = "none"
 
-        self._no_impact = _BandStats()
-        self._current = _BandStats()
-        self._probe = _BandStats()
-        self.last_no_impact_success_rate = 0.0
-        self.last_no_impact_crash_rate = 0.0
-        self.last_current_success_rate = 0.0
-        self.last_current_crash_rate = 0.0
-        self.last_probe_success_rate = 0.0
-        self.last_probe_crash_rate = 0.0
+def _allocate_counts(total: int, weights: torch.Tensor) -> torch.Tensor:
+    """Round weights to integer counts that sum to ``total``."""
 
-    @property
-    def last_success_rate(self) -> float:
-        """Backward-compatible dashboard alias."""
+    if total <= 0:
+        return torch.zeros(weights.numel(), dtype=torch.long)
+    normalized = weights / weights.clamp_min(1.0e-8).sum()
+    raw = normalized * float(total)
+    counts = raw.floor().to(torch.long)
+    remainder = int(total - int(counts.sum().item()))
+    if remainder > 0:
+        frac = raw - raw.floor()
+        _, extra = torch.topk(frac, remainder)
+        counts[extra] += 1
+    return counts
 
-        return self.last_current_success_rate
 
-    @property
-    def last_crash_rate(self) -> float:
-        """Backward-compatible dashboard alias."""
+@dataclass(frozen=True)
+class ContinuousCurriculumSample:
+    difficulty: torch.Tensor
+    scenario_type: torch.Tensor
+    hover_anchor: torch.Tensor
+    handoff_difficulty: torch.Tensor
+    impact_difficulty: torch.Tensor
+    impact_enabled: torch.Tensor
+    mix_kind: torch.Tensor
 
-        return self.last_current_crash_rate
 
-    def sample(self, num_envs, device, seed=None) -> CurriculumSample:
+class ContinuousRecoveryCurriculum:
+    """Adapt one shared difficulty from deterministic current-level exams."""
+
+    STATE_VERSION = 7
+    advance_delta = 0.05
+    retreat_delta = 0.025
+    required_streak = 2
+    hover_fraction = 0.05
+    current_fraction = 0.65
+    rehearsal_fraction = 0.20
+    probe_fraction = 0.10
+    min_recovery_scenario_fraction = 0.10
+    success_thresholds = {
+        "hover": 0.80,
+        "handoff": 0.80,
+        "impact": 0.70,
+        "handoff_impact": 0.65,
+    }
+    final_success_thresholds = {
+        "hover": 0.95,
+        "handoff": 0.80,
+        "impact": 0.75,
+        "handoff_impact": 0.60,
+    }
+    maximum_crash_rate = 0.05
+    severe_success_rate = 0.35
+    severe_crash_rate = 0.15
+
+    def __init__(
+        self,
+        *,
+        initial_difficulty: float = 0.0,
+        retention_floor: float = 0.0,
+        seed: int = 0,
+    ):
+        self.difficulty = float(initial_difficulty)
+        self.initial_difficulty = float(initial_difficulty)
+        self.retention_floor = float(retention_floor)
+        self.highest_mastered_difficulty = 0.0
+        self.advance_streak = 0
+        self.retreat_streak = 0
+        self.evaluations = 0
+        self.exams_at_difficulty = 0
+        self.last_exam_passed = False
+        self.last_exam_severe = False
+        self.last_exam_metrics: dict[str, dict[str, float]] = {}
+        self.last_scenario_weights = torch.ones(3, dtype=torch.float32) / 3.0
+        self.seed = int(seed)
+        self._rng = torch.Generator(device="cpu")
+        self._rng.manual_seed(self.seed)
+
+    def sample(
+        self,
+        num_envs: int,
+        device: torch.device | str,
+        *,
+        seed: int | None = None,
+        fixed_difficulty: float | None = None,
+    ) -> ContinuousCurriculumSample:
         device = torch.device(device)
-        generator = None
-        if seed is not None:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(seed)
+        generator = self._generator(seed)
 
-        draw = torch.rand(num_envs, device=device, generator=generator)
-        boundaries = torch.tensor(
+        if fixed_difficulty is not None:
+            difficulty = torch.full((num_envs,), float(fixed_difficulty), dtype=torch.float32)
+            scenario_type = torch.arange(num_envs, dtype=torch.long) % 3
+            mix_kind = torch.full((num_envs,), MIX_CURRENT, dtype=torch.long)
+            return self.parameters(
+                difficulty.to(device),
+                scenario_type.to(device),
+                mix_kind=mix_kind.to(device),
+            )
+
+        hover_count = int(round(num_envs * self.hover_fraction))
+        recovery_count = num_envs - hover_count
+        current_count = min(recovery_count, int(round(num_envs * self.current_fraction)))
+        rehearsal_count = min(
+            recovery_count - current_count,
+            int(round(num_envs * self.rehearsal_fraction)),
+        )
+        probe_count = recovery_count - current_count - rehearsal_count
+
+        difficulty = torch.zeros(num_envs, dtype=torch.float32)
+        hover_anchor = torch.zeros(num_envs, dtype=torch.bool)
+        mix_kind = torch.zeros(num_envs, dtype=torch.long)
+        hover_anchor[:hover_count] = True
+        mix_kind[:hover_count] = MIX_HOVER
+        recovery_ids = torch.arange(hover_count, num_envs)
+        current_ids = recovery_ids[:current_count]
+        rehearsal_ids = recovery_ids[current_count : current_count + rehearsal_count]
+        probe_ids = recovery_ids[current_count + rehearsal_count :]
+        difficulty[current_ids] = self.difficulty
+        mix_kind[current_ids] = MIX_CURRENT
+        if rehearsal_count:
+            difficulty[rehearsal_ids] = (
+                torch.rand(rehearsal_count, generator=generator) * self.difficulty
+            )
+            mix_kind[rehearsal_ids] = MIX_REHEARSAL
+        if probe_count:
+            difficulty[probe_ids] = min(1.0, self.difficulty + self.advance_delta)
+            mix_kind[probe_ids] = MIX_PROBE
+
+        scenario_weights = self.recovery_scenario_weights()
+        self.last_scenario_weights = scenario_weights.clone()
+        scenario_counts = _allocate_counts(recovery_count, scenario_weights)
+        scenario_type = torch.full((num_envs,), HANDOFF_SCENARIO, dtype=torch.long)
+        cursor = 0
+        for scenario_id, count in enumerate(scenario_counts.tolist()):
+            if count:
+                scenario_type[recovery_ids[cursor : cursor + count]] = scenario_id
+                cursor += count
+        recovery_order = recovery_ids[torch.randperm(recovery_count, generator=generator)]
+        scenario_type[recovery_ids] = scenario_type[recovery_order]
+        order = torch.randperm(num_envs, generator=generator)
+        return self.parameters(
+            difficulty[order].to(device),
+            scenario_type[order].to(device),
+            hover_anchor=hover_anchor[order].to(device),
+            mix_kind=mix_kind[order].to(device),
+        )
+
+    def sample_exam(
+        self,
+        num_envs: int,
+        device: torch.device | str,
+        *,
+        seed: int | None = None,
+    ) -> tuple[ContinuousCurriculumSample, dict[str, torch.Tensor]]:
+        """Build a balanced exam containing only the current difficulty."""
+
+        generator = self._generator(seed)
+        order = torch.randperm(num_envs, generator=generator)
+        chunks = torch.tensor_split(order, 4)
+        names = ("hover", "handoff", "impact", "handoff_impact")
+        exam_group = {name: chunk.to(device) for name, chunk in zip(names, chunks)}
+        difficulty = torch.full((num_envs,), self.difficulty, dtype=torch.float32)
+        hover_anchor = torch.zeros(num_envs, dtype=torch.bool)
+        scenario_type = torch.full((num_envs,), HANDOFF_SCENARIO, dtype=torch.long)
+        mix_kind = torch.full((num_envs,), MIX_CURRENT, dtype=torch.long)
+        hover_anchor[chunks[0]] = True
+        mix_kind[chunks[0]] = MIX_HOVER
+        difficulty[chunks[0]] = 0.0
+        scenario_type[chunks[2]] = IMPACT_SCENARIO
+        scenario_type[chunks[3]] = HANDOFF_IMPACT_SCENARIO
+        sample = self.parameters(
+            difficulty.to(device),
+            scenario_type.to(device),
+            hover_anchor=hover_anchor.to(device),
+            mix_kind=mix_kind.to(device),
+        )
+        return sample, exam_group
+
+    def next_exam_seed(self) -> int:
+        """Alternate forever between two fixed current-level exam papers."""
+
+        return self.seed + self.evaluations % 2
+
+    @staticmethod
+    def parameters(
+        difficulty: torch.Tensor,
+        scenario_type: torch.Tensor,
+        *,
+        hover_anchor: torch.Tensor | None = None,
+        mix_kind: torch.Tensor | None = None,
+    ) -> ContinuousCurriculumSample:
+        if hover_anchor is None:
+            hover_anchor = torch.zeros_like(scenario_type, dtype=torch.bool)
+        if mix_kind is None:
+            mix_kind = torch.where(
+                hover_anchor,
+                torch.full_like(scenario_type, MIX_HOVER),
+                torch.full_like(scenario_type, MIX_CURRENT),
+            )
+        impact_enabled = (scenario_type != HANDOFF_SCENARIO) & ~hover_anchor
+        handoff_enabled = (scenario_type != IMPACT_SCENARIO) & ~hover_anchor
+        return ContinuousCurriculumSample(
+            difficulty=difficulty,
+            scenario_type=scenario_type,
+            hover_anchor=hover_anchor,
+            handoff_difficulty=torch.where(handoff_enabled, difficulty, 0.0),
+            impact_difficulty=torch.where(impact_enabled, difficulty, 0.0),
+            impact_enabled=impact_enabled,
+            mix_kind=mix_kind,
+        )
+
+    def recovery_scenario_weights(self) -> torch.Tensor:
+        """Weight handoff / impact / handoff+impact by the latest exam deficit."""
+
+        equal = torch.ones(3, dtype=torch.float32) / 3.0
+        floor = self.min_recovery_scenario_fraction
+        metrics = self.last_exam_metrics
+        if not metrics or any(name not in metrics for name in RECOVERY_SCENARIO_NAMES):
+            return equal
+        passed = all(
+            metrics[name]["strict_success_rate"] >= self.success_thresholds[name]
+            and metrics[name]["crash_rate"] <= self.maximum_crash_rate
+            for name in RECOVERY_SCENARIO_NAMES
+        )
+        if passed:
+            return equal
+        gaps = torch.tensor(
             [
-                self.cfg.no_impact_fraction,
-                self.cfg.no_impact_fraction + self.cfg.easy_fraction,
-                self.cfg.no_impact_fraction + self.cfg.easy_fraction + self.cfg.middle_fraction,
-                self.cfg.no_impact_fraction
-                + self.cfg.easy_fraction
-                + self.cfg.middle_fraction
-                + self.cfg.current_fraction,
-            ],
-            device=device,
-        )
-        band = torch.bucketize(draw, boundaries).to(torch.uint8)
-        impacted = band > 0
-
-        scale = torch.rand(num_envs, device=device, generator=generator)
-        difficulty = torch.zeros(num_envs, device=device)
-        level = self.difficulty
-        ranges = (
-            (0.0, 0.0),
-            (0.0, 0.30 * level),
-            (0.30 * level, 0.70 * level),
-            (0.70 * level, level),
-        )
-        for band_id, (low, high) in enumerate(ranges):
-            mask = band == band_id
-            difficulty[mask] = low + scale[mask] * (high - low)
-
-        probe = band == 4
-        probe_low = level if level < 1.0 else max(0.0, 1.0 - self.cfg.probe_band_width)
-        probe_high = min(1.0, level + self.cfg.probe_band_width)
-        difficulty[probe] = probe_low + scale[probe] * (probe_high - probe_low)
-        return CurriculumSample(impacted=impacted, difficulty=difficulty, band=band)
-
-    def record_batch(self, recovered, crashed, band, global_step: int = 0) -> bool:
-        recovered = recovered.bool()
-        crashed = crashed.bool()
-        band = band.to(torch.uint8)
-        self._no_impact.add(recovered, crashed, band == 0)
-        self._current.add(recovered, crashed, band == 3)
-        self._probe.add(recovered, crashed, band == 4)
-        if (
-            self._no_impact.episodes < self.cfg.no_impact_window_episodes
-            or self._current.episodes < self.cfg.current_window_episodes
-            or self._probe.episodes < self.cfg.probe_window_episodes
-        ):
-            return False
-
-        self.last_no_impact_success_rate = self._no_impact.successes / self._no_impact.episodes
-        self.last_no_impact_crash_rate = self._no_impact.crashes / self._no_impact.episodes
-        self.last_current_success_rate = self._current.successes / self._current.episodes
-        self.last_current_crash_rate = self._current.crashes / self._current.episodes
-        self.last_probe_success_rate = self._probe.successes / self._probe.episodes
-        self.last_probe_crash_rate = self._probe.crashes / self._probe.episodes
-
-        promote = (
-            self.last_no_impact_success_rate >= self.cfg.promote_no_impact_success_rate
-            and self.last_current_success_rate >= self.cfg.promote_current_success_rate
-            and self.last_current_crash_rate <= self.cfg.promote_current_crash_rate
-            and self.last_probe_success_rate >= self.cfg.promote_probe_success_rate
-        )
-        demote = (
-            self.last_current_success_rate < self.cfg.demote_current_success_rate
-            or self.last_current_crash_rate > self.cfg.demote_current_crash_rate
-        )
-
-        self.last_action = "none"
-        if int(global_step) < self.next_change_step:
-            self.promotion_streak = 0
-            self.demotion_streak = 0
-        else:
-            self.promotion_streak = self.promotion_streak + 1 if promote else 0
-            self.demotion_streak = self.demotion_streak + 1 if demote else 0
-
-            if self.promotion_streak >= self.cfg.consecutive_windows and self.difficulty < 1.0:
-                old_difficulty = self.difficulty
-                self.mastered_difficulty = max(self.mastered_difficulty, old_difficulty)
-                self.difficulty = min(1.0, old_difficulty + self.cfg.promote_step)
-                self.promotion_count += 1
-                self.last_action = "promote"
-                self.next_change_step = int(global_step) + self.cfg.cooldown_steps
-                self.promotion_streak = 0
-                self.demotion_streak = 0
-            elif (
-                self.demotion_streak >= self.cfg.consecutive_windows
-                and self.difficulty > self.cfg.minimum_difficulty
-            ):
-                self.difficulty = max(
-                    self.cfg.minimum_difficulty,
-                    self.difficulty - self.cfg.demote_step,
+                max(
+                    0.0,
+                    self.success_thresholds[name]
+                    - metrics[name]["strict_success_rate"],
                 )
-                self.demotion_count += 1
-                self.last_action = "demote"
-                self.next_change_step = int(global_step) + self.cfg.cooldown_steps
-                self.promotion_streak = 0
-                self.demotion_streak = 0
+                for name in RECOVERY_SCENARIO_NAMES
+            ],
+            dtype=torch.float32,
+        )
+        if float(gaps.sum()) <= 0.0:
+            return equal
+        gaps = gaps / gaps.sum()
+        remaining = 1.0 - 3.0 * floor
+        return remaining * gaps + floor
 
-        self._no_impact.reset()
-        self._current.reset()
-        self._probe.reset()
-        return True
+    def update_exam(self, assessment: Mapping[str, Mapping[str, float]]) -> float:
+        """Update from one deterministic exam at the current difficulty."""
+
+        required = tuple(self.success_thresholds)
+        metrics = {
+            name: {str(key): float(value) for key, value in assessment[name].items()}
+            for name in self.success_thresholds
+        }
+        passed = all(
+            metrics[name]["strict_success_rate"] >= self.success_thresholds[name]
+            and metrics[name]["crash_rate"] <= self.maximum_crash_rate
+            for name in required
+        )
+        severe = any(
+            metrics[name]["coarse_success_rate"] < self.severe_success_rate
+            or metrics[name]["crash_rate"] > self.severe_crash_rate
+            for name in required
+        )
+        self.evaluations += 1
+        self.exams_at_difficulty += 1
+        self.last_exam_metrics = metrics
+        self.last_exam_passed = passed
+        self.last_exam_severe = severe
+
+        if passed:
+            self.advance_streak += 1
+            self.retreat_streak = 0
+            if self.advance_streak >= self.required_streak:
+                mastered = self.difficulty
+                self.difficulty = min(1.0, self.difficulty + self.advance_delta)
+                self.highest_mastered_difficulty = max(
+                    self.highest_mastered_difficulty, mastered
+                )
+                self.exams_at_difficulty = 0
+                self._clear_streaks()
+        elif severe:
+            self.retreat_streak += 1
+            self.advance_streak = 0
+            if self.retreat_streak >= self.required_streak:
+                self.difficulty = max(0.0, self.difficulty - self.retreat_delta)
+                self.exams_at_difficulty = 0
+                self._clear_streaks()
+        else:
+            self._clear_streaks()
+        return self.difficulty
+
+    def set_difficulty(self, difficulty: float) -> None:
+        self.difficulty = float(difficulty)
+        self.exams_at_difficulty = 0
+        self._clear_streaks()
+
+    @property
+    def retention_ceiling(self) -> float:
+        return max(self.retention_floor, self.highest_mastered_difficulty)
+
+    def status_diagnostics(self) -> dict[str, float]:
+        """Live curriculum fields that should update between exams."""
+
+        weights = self.last_scenario_weights
+        return {
+            "difficulty": self.difficulty,
+            "initial_difficulty": self.initial_difficulty,
+            "highest_mastered_difficulty": self.highest_mastered_difficulty,
+            "advance_streak": float(self.advance_streak),
+            "retreat_streak": float(self.retreat_streak),
+            "evaluations": float(self.evaluations),
+            "exams_at_difficulty": float(self.exams_at_difficulty),
+            "exam_passed": float(self.last_exam_passed),
+            "exam_severe": float(self.last_exam_severe),
+            "scenario_weight_handoff": float(weights[0]),
+            "scenario_weight_impact": float(weights[1]),
+            "scenario_weight_handoff_impact": float(weights[2]),
+        }
+
+    def diagnostics(self) -> dict[str, float]:
+        values = self.status_diagnostics()
+        for name, metrics in self.last_exam_metrics.items():
+            for metric_name, value in metrics.items():
+                values[f"{name}_{metric_name}"] = value
+        return values
 
     def state_dict(self) -> dict:
         return {
             "version": self.STATE_VERSION,
-            "cfg": asdict(self.cfg),
             "difficulty": self.difficulty,
-            "mastered_difficulty": self.mastered_difficulty,
-            "promotion_count": self.promotion_count,
-            "demotion_count": self.demotion_count,
-            "promotion_streak": self.promotion_streak,
-            "demotion_streak": self.demotion_streak,
-            "next_change_step": self.next_change_step,
-            "last_action": self.last_action,
-            "no_impact": self._no_impact.state_dict(),
-            "current": self._current.state_dict(),
-            "probe": self._probe.state_dict(),
-            "last_rates": {
-                "no_impact_success": self.last_no_impact_success_rate,
-                "no_impact_crash": self.last_no_impact_crash_rate,
-                "current_success": self.last_current_success_rate,
-                "current_crash": self.last_current_crash_rate,
-                "probe_success": self.last_probe_success_rate,
-                "probe_crash": self.last_probe_crash_rate,
-            },
+            "initial_difficulty": self.initial_difficulty,
+            "retention_floor": self.retention_floor,
+            "highest_mastered_difficulty": self.highest_mastered_difficulty,
+            "advance_streak": self.advance_streak,
+            "retreat_streak": self.retreat_streak,
+            "evaluations": self.evaluations,
+            "exams_at_difficulty": self.exams_at_difficulty,
+            "last_exam_passed": self.last_exam_passed,
+            "last_exam_severe": self.last_exam_severe,
+            "last_exam_metrics": self.last_exam_metrics,
+            "seed": self.seed,
+            "rng_state": self._rng.get_state(),
         }
 
-    def load_state_dict(self, state):
-        if int(state.get("version", 1)) < self.STATE_VERSION:
-            self.difficulty = float(
-                min(1.0, max(self.cfg.minimum_difficulty, state.get("difficulty", 0.10)))
-            )
-            self.mastered_difficulty = max(
-                0.0,
-                min(self.difficulty, state.get("mastered_difficulty", 0.0)),
-            )
-            self.promotion_count = int(state.get("promotion_count", 0))
-            self.demotion_count = 0
-            self.promotion_streak = 0
-            self.demotion_streak = 0
-            self.next_change_step = 0
-            self.last_action = "legacy_reset"
-            self._no_impact.reset()
-            self._current.reset()
-            self._probe.reset()
-            self.last_no_impact_success_rate = 0.0
-            self.last_no_impact_crash_rate = 0.0
-            self.last_current_success_rate = float(state.get("last_success_rate", 0.0))
-            self.last_current_crash_rate = float(state.get("last_crash_rate", 0.0))
-            self.last_probe_success_rate = 0.0
-            self.last_probe_crash_rate = 0.0
-            return
+    def load_state_dict(self, state: Mapping) -> None:
+        self.difficulty = float(state["difficulty"])
+        self.initial_difficulty = float(
+            state.get("initial_difficulty", self.difficulty)
+        )
+        self.retention_floor = float(
+            state.get("retention_floor", state.get("initial_difficulty", 0.0))
+        )
+        self.highest_mastered_difficulty = float(
+            state.get("highest_mastered_difficulty", 0.0)
+        )
+        self.advance_streak = int(state.get("advance_streak", 0))
+        self.retreat_streak = int(state.get("retreat_streak", 0))
+        self.evaluations = int(state.get("evaluations", 0))
+        self.exams_at_difficulty = int(state.get("exams_at_difficulty", 0))
+        self.last_exam_passed = bool(state.get("last_exam_passed", False))
+        self.last_exam_severe = bool(state.get("last_exam_severe", False))
+        self.last_exam_metrics = {
+            str(name): {str(key): float(value) for key, value in metrics.items()}
+            for name, metrics in state.get("last_exam_metrics", {}).items()
+        }
+        self.seed = int(state.get("seed", 0))
+        self._rng = torch.Generator(device="cpu")
+        if "rng_state" in state:
+            self._rng.set_state(state["rng_state"].cpu())
+        else:
+            self._rng.manual_seed(self.seed)
 
-        self.difficulty = float(
-            min(1.0, max(self.cfg.minimum_difficulty, state["difficulty"]))
-        )
-        self.mastered_difficulty = float(
-            min(self.difficulty, max(0.0, state.get("mastered_difficulty", 0.0)))
-        )
-        self.promotion_count = int(state.get("promotion_count", 0))
-        self.demotion_count = int(state.get("demotion_count", 0))
-        self.promotion_streak = int(state.get("promotion_streak", 0))
-        self.demotion_streak = int(state.get("demotion_streak", 0))
-        self.next_change_step = int(state.get("next_change_step", 0))
-        self.last_action = str(state.get("last_action", "none"))
-        self._no_impact.load_state_dict(state.get("no_impact"))
-        self._current.load_state_dict(state.get("current"))
-        self._probe.load_state_dict(state.get("probe"))
-        rates = state.get("last_rates", {})
-        self.last_no_impact_success_rate = float(rates.get("no_impact_success", 0.0))
-        self.last_no_impact_crash_rate = float(rates.get("no_impact_crash", 0.0))
-        self.last_current_success_rate = float(rates.get("current_success", 0.0))
-        self.last_current_crash_rate = float(rates.get("current_crash", 0.0))
-        self.last_probe_success_rate = float(rates.get("probe_success", 0.0))
-        self.last_probe_crash_rate = float(rates.get("probe_crash", 0.0))
+    def _generator(self, seed: int | None) -> torch.Generator:
+        if seed is None:
+            return self._rng
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+        return generator
+
+    def _clear_streaks(self) -> None:
+        self.advance_streak = 0
+        self.retreat_streak = 0

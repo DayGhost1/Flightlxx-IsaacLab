@@ -21,11 +21,15 @@ class DomainRandomizationCfg:
     # open-circuit voltages 14.8--16.4 V and load-sag resistance 0.02--0.06 ohm.
     battery_voltage_v: tuple[float, float] = (14.8, 16.4)
     battery_internal_resistance_ohm: tuple[float, float] = (0.02, 0.06)
-    position_noise_std_m: tuple[float, float] = (0.003, 0.015)
-    velocity_noise_std_mps: tuple[float, float] = (0.01, 0.05)
-    attitude_noise_std_rad: tuple[float, float] = (0.00175, 0.00873)
-    gyro_noise_std_radps: tuple[float, float] = (0.002, 0.01)
-    gyro_bias_radps: tuple[float, float] = (-0.01, 0.01)
+    # 2026-08-29 SnowyOwl3 rosbag rest segments (21 windows, position range < 10 mm).
+    # Ranges are measured median to about 3x p90. Linear-velocity DR is VRPN
+    # twist.linear, not a 60 ms pose finite-difference.
+    position_noise_std_m: tuple[float, float] = (4.4e-5, 2.76e-4)
+    velocity_noise_std_mps: tuple[float, float] = (0.0052, 0.0187)
+    attitude_noise_std_rad: tuple[float, float] = (0.00074, 0.00385)
+    gyro_noise_std_radps: tuple[float, float] = (0.00098, 0.0037)
+    gyro_bias_radps: tuple[float, float] = (-0.0037, 0.0037)
+    vicon_measurement_age_s: tuple[float, float] = (0.005, 0.020)
     vicon_dropout_probability: tuple[float, float] = (0.0, 0.01)
 
 
@@ -45,6 +49,7 @@ class DomainParameters:
     attitude_noise_std: torch.Tensor
     gyro_noise_std: torch.Tensor
     gyro_bias: torch.Tensor
+    vicon_measurement_age_s: torch.Tensor
     vicon_dropout_probability: torch.Tensor
 
 
@@ -116,12 +121,27 @@ def sample_domain_parameters(
     attitude_noise_std = _uniform((num_envs,), *cfg.attitude_noise_std_rad, device, generator)
     gyro_noise_std = _uniform((num_envs,), *cfg.gyro_noise_std_radps, device, generator)
     gyro_bias = _uniform((num_envs, 3), *cfg.gyro_bias_radps, device, generator)
+    vicon_measurement_age_s = _uniform(
+        (num_envs,), *cfg.vicon_measurement_age_s, device, generator
+    )
     vicon_dropout_probability = _uniform(
         (num_envs,), *cfg.vicon_dropout_probability, device, generator
     )
     return DomainParameters(
-        mass, inertia, com, thrust_scale, motor_scale, actuator_tau, delay_steps,
-        battery_voltage_v, battery_internal_resistance_ohm,
-        position_noise_std, velocity_noise_std, attitude_noise_std, gyro_noise_std, gyro_bias,
-        vicon_dropout_probability,
+        mass=mass,
+        inertia=inertia,
+        com=com,
+        thrust_scale=thrust_scale,
+        motor_scale=motor_scale,
+        actuator_tau=actuator_tau,
+        delay_steps=delay_steps,
+        battery_voltage_v=battery_voltage_v,
+        battery_internal_resistance_ohm=battery_internal_resistance_ohm,
+        position_noise_std=position_noise_std,
+        velocity_noise_std=velocity_noise_std,
+        attitude_noise_std=attitude_noise_std,
+        gyro_noise_std=gyro_noise_std,
+        gyro_bias=gyro_bias,
+        vicon_measurement_age_s=vicon_measurement_age_s,
+        vicon_dropout_probability=vicon_dropout_probability,
     )

@@ -6,18 +6,18 @@ from .actuation import (
     physx_angular_velocity_limit_deg_s,
 )
 from .curriculum import (
-    CurriculumSample,
-    ImpactCurriculum,
-    ImpactCurriculumCfg,
-    TwoStageCurriculum,
-    TwoStageCurriculumCfg,
-    TwoStageCurriculumSample,
+    ContinuousCurriculumSample,
+    ContinuousRecoveryCurriculum,
+    HANDOFF_SCENARIO,
+    IMPACT_SCENARIO,
+    HANDOFF_IMPACT_SCENARIO,
+    SINGLE_IMPACT_SCENARIO,
+    assess_curriculum_exam,
 )
 from .disturbance import (
     ImpactSample,
     ImpactSamplingCfg,
     classify_impact_phase,
-    physical_impact_metadata,
     sample_impact_wrench,
 )
 from .history import VectorizedHistory
@@ -31,8 +31,14 @@ from .randomization import (
     sample_domain_parameters,
     write_com_offsets,
 )
-from .recovery import RecoveryCriteria, update_recovery_dwell
-from .reward import HoverRewardCfg, unified_hover_reward
+from .recovery import (
+    RecoveryCriteria,
+    curriculum_episode_level,
+    curriculum_recovery_criteria,
+    recovery_reached,
+    update_recovery_dwell,
+)
+from .reward import RecoveryRewardCfg, recovery_reward, recovery_state_cost
 from .tcn import CausalTCN
 from .vicon_bridge import VirtualViconBridge
 
@@ -41,24 +47,27 @@ __all__ = [
     "MotorActuatorCfg",
     "ActionDelayBuffer",
     "physx_angular_velocity_limit_deg_s",
-    "CurriculumSample",
     "DomainParameters",
     "DomainRandomizationCfg",
-    "ImpactCurriculum",
-    "ImpactCurriculumCfg",
-    "TwoStageCurriculum",
-    "TwoStageCurriculumCfg",
-    "TwoStageCurriculumSample",
+    "ContinuousRecoveryCurriculum",
+    "ContinuousCurriculumSample",
+    "HANDOFF_SCENARIO",
+    "IMPACT_SCENARIO",
+    "HANDOFF_IMPACT_SCENARIO",
+    "SINGLE_IMPACT_SCENARIO",
+    "assess_curriculum_exam",
     "ImpactSample",
     "ImpactSamplingCfg",
-    "HoverRewardCfg",
+    "RecoveryRewardCfg",
     "HandoffState",
     "fixed_target_hover_state",
     "RecoveryCriteria",
+    "curriculum_episode_level",
+    "curriculum_recovery_criteria",
+    "recovery_reached",
     "VectorizedHistory",
     "attitude_cost",
     "classify_impact_phase",
-    "physical_impact_metadata",
     "quat_error",
     "quat_mul",
     "quat_rotate_inverse",
@@ -66,7 +75,8 @@ __all__ = [
     "sample_domain_parameters",
     "sample_handoff_state",
     "sample_impact_wrench",
-    "unified_hover_reward",
+    "recovery_reward",
+    "recovery_state_cost",
     "update_recovery_dwell",
     "write_com_offsets",
     "CausalTCN",

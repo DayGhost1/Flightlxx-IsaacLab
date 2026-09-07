@@ -58,6 +58,7 @@ class ViconBridgeCfg:
     sample_hz: float
     output_hz: float
     angular_window_s: float
+    max_angular_dt_s: float
     measurement_age_s: float
     sampling_jitter_s: float
     source: str
@@ -139,6 +140,7 @@ class SnowyOwl3PlatformCfg:
                 sample_hz=float(raw_vicon.get("sample_hz", 0.0)),
                 output_hz=float(raw_vicon.get("output_hz", 0.0)),
                 angular_window_s=float(raw_vicon.get("angular_window_s", 0.0)),
+                max_angular_dt_s=float(raw_vicon.get("max_angular_dt_s", 0.05)),
                 measurement_age_s=float(raw_vicon.get("measurement_age_s", -1.0)),
                 sampling_jitter_s=float(raw_vicon.get("sampling_jitter_s", -1.0)),
                 source=str(raw_vicon.get("source", "")),
@@ -218,6 +220,8 @@ class SnowyOwl3PlatformCfg:
             raise ValueError("Vicon sample_hz and output_hz must be positive")
         if self.vicon.angular_window_s <= 0.0 or self.vicon.measurement_age_s < 0.0:
             raise ValueError("Vicon angular_window_s must be positive and measurement_age_s non-negative")
+        if self.vicon.max_angular_dt_s <= 0.0:
+            raise ValueError("Vicon max_angular_dt_s must be positive")
         if self.vicon.sampling_jitter_s < 0.0 or self.vicon.sampling_jitter_s >= 1.0 / self.vicon.sample_hz:
             raise ValueError("Vicon sampling_jitter_s must be non-negative and smaller than the sample period")
         if not self.vicon.source:
